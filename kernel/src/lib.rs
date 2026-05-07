@@ -182,7 +182,7 @@ pub use error::{DeltaResult, Error};
 use expressions::{literal_expression_transform, Scalar};
 pub use expressions::{Expression, ExpressionRef, Predicate, PredicateRef};
 pub use log_compaction::{should_compact, LogCompactionWriter};
-pub use plan::{DeclarativePlanNode, PlanExecutor, PlanResult};
+pub use plan::{DeclarativePlanNode, PlanExecutor, PlanResult, ScanFileFormat};
 use schema::{StructField, StructType};
 pub use snapshot::{Snapshot, SnapshotRef};
 

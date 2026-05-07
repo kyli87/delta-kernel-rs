@@ -6,19 +6,20 @@
 use std::fmt;
 use std::sync::Arc;
 
+use super::json::PlanBasedJsonHandler;
+use super::parquet::PlanBasedParquetHandler;
 use super::storage::PlanBasedStorageHandler;
 use crate::engine::arrow_expression::ArrowEvaluationHandler;
 use crate::engine::default::executor::TaskExecutor;
-use crate::engine::default::json::DefaultJsonHandler;
-use crate::engine::default::parquet::DefaultParquetHandler;
 use crate::object_store::DynObjectStore;
 use crate::plan::PlanExecutor;
 use crate::{Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler};
 
-/// An [`Engine`] that routes storage operations through a [`PlanExecutor`].
+/// An [`Engine`] that routes storage and file-read operations through a [`PlanExecutor`].
 ///
-/// The storage handler converts [`StorageHandler`] calls into [`DeclarativePlanNode`]s and
-/// delegates them to the plan executor. JSON, Parquet, and evaluation handlers use the same
+/// Storage, JSON file reads, and Parquet file reads are converted into
+/// [`DeclarativePlanNode`]s and delegated to the plan executor. Non-read operations (JSON
+/// parsing/writing, Parquet writing/footer reads) and expression evaluation use the same
 /// default implementations as [`DefaultEngine`].
 ///
 /// [`DeclarativePlanNode`]: crate::plan::DeclarativePlanNode
@@ -26,8 +27,8 @@ use crate::{Engine, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandl
 pub struct PlanBasedEngine<E: TaskExecutor> {
     executor: Arc<dyn PlanExecutor>,
     storage: Arc<PlanBasedStorageHandler>,
-    json: Arc<DefaultJsonHandler<E>>,
-    parquet: Arc<DefaultParquetHandler<E>>,
+    json: Arc<PlanBasedJsonHandler<E>>,
+    parquet: Arc<PlanBasedParquetHandler<E>>,
     evaluation: Arc<ArrowEvaluationHandler>,
 }
 
@@ -42,8 +43,9 @@ impl<E: TaskExecutor> fmt::Debug for PlanBasedEngine<E> {
 impl<E: TaskExecutor> PlanBasedEngine<E> {
     /// Create a new `PlanBasedEngine`.
     ///
-    /// Storage operations are delegated to `plan_executor`. The JSON, Parquet, and evaluation
-    /// handlers are constructed from the given `object_store` and `task_executor`, identically
+    /// Storage, JSON file reads, and Parquet file reads are delegated to `plan_executor`.
+    /// Non-read operations (JSON parsing/writing, Parquet writing/footer reads) and expression
+    /// evaluation are constructed from the given `object_store` and `task_executor`, identically
     /// to [`DefaultEngine`](crate::engine::default::DefaultEngine).
     pub fn new(
         object_store: Arc<DynObjectStore>,
@@ -52,11 +54,16 @@ impl<E: TaskExecutor> PlanBasedEngine<E> {
     ) -> Self {
         Self {
             storage: Arc::new(PlanBasedStorageHandler::new(plan_executor.clone())),
-            json: Arc::new(DefaultJsonHandler::new(
+            json: Arc::new(PlanBasedJsonHandler::new(
                 object_store.clone(),
                 task_executor.clone(),
+                plan_executor.clone(),
             )),
-            parquet: Arc::new(DefaultParquetHandler::new(object_store, task_executor)),
+            parquet: Arc::new(PlanBasedParquetHandler::new(
+                object_store,
+                task_executor,
+                plan_executor.clone(),
+            )),
             executor: plan_executor,
             evaluation: Arc::new(ArrowEvaluationHandler {}),
         }

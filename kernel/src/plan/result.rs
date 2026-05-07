@@ -14,7 +14,7 @@ use crate::{DeltaResult, EngineData};
 /// - [`Unit`](Self::Unit) signals successful completion of a side-effect operation (e.g. writes).
 pub enum PlanResult {
     /// A stream of columnar data batches produced by the plan.
-    Data(Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>>>),
+    Data(Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>),
     /// A stream of raw byte buffers, one per file or file slice.
     ByteStream(Box<dyn Iterator<Item = DeltaResult<Bytes>>>),
     /// The plan completed successfully with no output data.

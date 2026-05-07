@@ -6,7 +6,7 @@
 //!
 //! The algebra will evolve over time to include relational operators (filter, project, join,
 //! etc.). For now it contains simple 1-for-1 operation nodes that mirror [`StorageHandler`]
-//! methods.
+//! methods, plus a [`Scan`](DeclarativePlanNode::Scan) node for structured file reads.
 //!
 //! [`StorageHandler`]: crate::StorageHandler
 
@@ -20,7 +20,17 @@ pub use result::PlanResult;
 pub use schema::FILE_META_SCHEMA;
 use url::Url;
 
-use crate::FileSlice;
+use crate::schema::SchemaRef;
+use crate::{FileMeta, FileSlice, PredicateRef};
+
+/// The file format for a [`Scan`](DeclarativePlanNode::Scan) operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanFileFormat {
+    /// Apache Parquet format.
+    Parquet,
+    /// Newline-delimited JSON format.
+    Json,
+}
 
 /// A declarative plan node representing a data-intensive operation.
 ///
@@ -70,5 +80,24 @@ pub enum DeclarativePlanNode {
     HeadFile {
         /// The URL of the file to inspect.
         url: Url,
+    },
+    /// Read and parse structured data files (Parquet or JSON), returning columnar data.
+    ///
+    /// Returns [`PlanResult::Data`] with columns matching the provided `physical_schema`.
+    /// The ordering contract is the same as [`JsonHandler::read_json_files`] and
+    /// [`ParquetHandler::read_parquet_files`]: data must be emitted file-by-file in the
+    /// order given, with rows in file order, and no cross-file merging.
+    ///
+    /// [`JsonHandler::read_json_files`]: crate::JsonHandler::read_json_files
+    /// [`ParquetHandler::read_parquet_files`]: crate::ParquetHandler::read_parquet_files
+    Scan {
+        /// The format of the files to read.
+        format: ScanFileFormat,
+        /// Metadata for the files to read.
+        files: Vec<FileMeta>,
+        /// Select list and order of columns to read.
+        physical_schema: SchemaRef,
+        /// Optional push-down predicate hint (executor is free to ignore it).
+        predicate: Option<PredicateRef>,
     },
 }
