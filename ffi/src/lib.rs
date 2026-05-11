@@ -1517,7 +1517,7 @@ mod tests {
         use std::ptr::NonNull;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        use crate::plan::executor::{get_ffi_plan_executor, SharedPlanExecutor};
+        use crate::plan::executor::{get_ffi_plan_executor, CPlanResult, SharedPlanExecutor};
 
         struct Probe {
             invocations: AtomicUsize,
@@ -1526,10 +1526,10 @@ mod tests {
         extern "C" fn record_callback(
             context: NullableCvoid,
             _plan_proto: KernelBytesSlice,
-        ) -> OptionalValue<Handle<ExclusiveRustString>> {
+        ) -> CPlanResult {
             let probe = unsafe { &*(context.unwrap().as_ptr() as *const Probe) };
             probe.invocations.fetch_add(1, Ordering::SeqCst);
-            OptionalValue::None
+            CPlanResult::Unit
         }
 
         let probe = Box::new(Probe {
