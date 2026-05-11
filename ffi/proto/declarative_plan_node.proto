@@ -1,0 +1,79 @@
+syntax = "proto3";
+
+package delta_kernel_ffi.plan;
+
+// Wire format for delta_kernel::plan::DeclarativePlanNode.
+//
+// Mirrors the Rust enum variants. Used to ferry plan nodes from Rust to a
+// non-Rust executor (e.g. Java) over FFI as serialized bytes.
+
+// File format for a Scan operation. Mirrors delta_kernel::plan::ScanFileFormat.
+enum ScanFileFormat {
+  SCAN_FILE_FORMAT_UNSPECIFIED = 0;
+  SCAN_FILE_FORMAT_PARQUET = 1;
+  SCAN_FILE_FORMAT_JSON = 2;
+}
+
+// File metadata; mirrors delta_kernel::FileMeta. Path is a fully qualified URL.
+message FileMeta {
+  string location = 1;
+  int64 last_modified = 2;
+  uint64 size = 3;
+}
+
+// Optional half-open byte range [start, end). Mirrors `std::ops::Range<u64>`.
+message ByteRange {
+  uint64 start = 1;
+  uint64 end = 2;
+}
+
+// File slice; mirrors `delta_kernel::FileSlice = (Url, Option<Range<u64>>)`.
+message FileSlice {
+  string url = 1;
+  ByteRange range = 2; // unset = read whole file
+}
+
+// List files at the given URL.
+message FileListing {
+  string url = 1;
+}
+
+// Read raw bytes from one or more file slices.
+message ReadBytes {
+  repeated FileSlice files = 1;
+}
+
+// Write raw bytes to a file at the given URL.
+message WriteBytes {
+  string url = 1;
+  bytes data = 2;
+  bool overwrite = 3;
+}
+
+// HEAD request for a single file.
+message HeadFile {
+  string url = 1;
+}
+
+// Read and parse structured data files (Parquet or JSON).
+//
+// physical_schema_json is a JSON-serialized delta_kernel::schema::StructType (the standard
+// kernel schema serialization). predicate is intentionally opaque for now and may be empty;
+// a future revision will define a structured predicate message.
+message Scan {
+  ScanFileFormat format = 1;
+  repeated FileMeta files = 2;
+  string physical_schema_json = 3;
+  bytes predicate = 4; // TODO: structured predicate; opaque for now
+}
+
+// Top-level declarative plan node. Exactly one of the `op` fields is set.
+message DeclarativePlanNode {
+  oneof op {
+    FileListing file_listing = 1;
+    ReadBytes read_bytes = 2;
+    WriteBytes write_bytes = 3;
+    HeadFile head_file = 4;
+    Scan scan = 5;
+  }
+}
