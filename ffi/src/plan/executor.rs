@@ -94,30 +94,31 @@ pub enum CNextBytes {
 
 /// An engine-implemented streaming iterator of [`EngineData`] batches.
 ///
-/// `state` is opaque to kernel; it is passed back into `next` and `free`. `next` returns
-/// [`CNextEngineData`] until iteration completes; `free` is called exactly once after the
-/// kernel-side adapter is dropped (which itself happens after the consuming code releases
-/// the [`PlanResult::Data`] iterator).
+/// `state` is opaque to kernel; it is passed back into `next`. `next` returns
+/// [`CNextEngineData`] until iteration completes. The iterator does NOT own its state --
+/// state lifetime is managed at the [`CPlanResultWrapper`] level via its `free` callback,
+/// which is invoked when the kernel-side adapter is dropped (which itself happens after the
+/// consuming code releases the [`PlanResult::Data`] iterator).
 #[repr(C)]
 pub struct CEngineDataIterator {
     pub state: NullableCvoid,
     pub next: extern "C" fn(state: NullableCvoid) -> CNextEngineData,
-    pub free: extern "C" fn(state: NullableCvoid),
 }
 
 /// An engine-implemented streaming iterator of byte buffers. See [`CEngineDataIterator`] for
-/// state/free semantics.
+/// state semantics; cleanup is performed by [`CPlanResultWrapper::free`].
 #[repr(C)]
 pub struct CBytesIterator {
     pub state: NullableCvoid,
     pub next: extern "C" fn(state: NullableCvoid) -> CNextBytes,
-    pub free: extern "C" fn(state: NullableCvoid),
 }
 
 /// The result of executing a [`DeclarativePlanNode`] via [`CExecutePlan`].
 ///
 /// Mirrors [`PlanResult`]: streaming variants carry opaque iterators that kernel drains, and
-/// errors transfer ownership of an allocated string handle to Rust.
+/// errors transfer ownership of an allocated string handle to Rust. Always carried inside a
+/// [`CPlanResultWrapper`], which provides the engine-side cleanup callback covering this
+/// `CPlanResult` and any state referenced by its nested iterators.
 #[repr(C)]
 pub enum CPlanResult {
     /// The plan completed successfully with no output data.
@@ -130,6 +131,21 @@ pub enum CPlanResult {
     Err(Handle<ExclusiveRustString>),
 }
 
+/// Engine-allocated wrapper around a [`CPlanResult`]. The engine attaches an opaque `state`
+/// pointer and a `free` callback; kernel guarantees `free(state)` is invoked exactly once
+/// after the result (and any iterators it carries) is no longer needed. This lets the
+/// engine maintain a single arena per plan execution that owns the result enum, any
+/// iterator state, and any buffers transitively referenced.
+///
+/// `state` is opaque to kernel and is passed verbatim back to `free`. It is valid to pass
+/// `None` for `state` if `free` requires no context (e.g. a no-op cleanup).
+#[repr(C)]
+pub struct CPlanResultWrapper {
+    pub result: CPlanResult,
+    pub state: NullableCvoid,
+    pub free: extern "C" fn(state: NullableCvoid),
+}
+
 /// C callback that delegates [`DeclarativePlanNode`] execution to the engine.
 ///
 /// `plan_proto` is a borrowed slice containing a serialized
@@ -137,24 +153,45 @@ pub enum CPlanResult {
 /// for the duration of the callback. `context` is the opaque pointer originally passed to
 /// [`get_ffi_plan_executor`].
 ///
-/// The returned [`CPlanResult`] is consumed by the kernel; ownership of any handles or
-/// engine-owned buffers it carries transfers to Rust per the rules documented on the
-/// individual variants.
+/// The returned [`CPlanResultWrapper`] is consumed by the kernel; ownership of any handles
+/// or engine-owned buffers it carries transfers to Rust per the rules documented on the
+/// individual [`CPlanResult`] variants and on [`CPlanResultWrapper`].
 pub type CExecutePlan =
-    extern "C" fn(context: NullableCvoid, plan_proto: KernelBytesSlice) -> CPlanResult;
+    extern "C" fn(context: NullableCvoid, plan_proto: KernelBytesSlice) -> CPlanResultWrapper;
 
 // ============================================================================
 // Rust-side adapters
 // ============================================================================
 
-/// Drains a [`CEngineDataIterator`] as a Rust iterator of [`EngineData`] batches.
-struct FfiDataIter(CEngineDataIterator);
+/// RAII guard that invokes [`CPlanResultWrapper::free`] exactly once on drop, releasing all
+/// engine-side state associated with a plan result (including iterator state and any
+/// transitively referenced buffers).
+struct PlanResultCleanup {
+    state: NullableCvoid,
+    free: extern "C" fn(state: NullableCvoid),
+}
+
+impl Drop for PlanResultCleanup {
+    fn drop(&mut self) {
+        (self.free)(self.state);
+    }
+}
+
+unsafe impl Send for PlanResultCleanup {}
+
+/// Drains a [`CEngineDataIterator`] as a Rust iterator of [`EngineData`] batches. Cleanup
+/// of the underlying iterator state is handled by the embedded [`PlanResultCleanup`] when
+/// the iterator is dropped.
+struct FfiDataIter {
+    iter: CEngineDataIterator,
+    _cleanup: PlanResultCleanup,
+}
 
 impl Iterator for FfiDataIter {
     type Item = DeltaResult<Box<dyn EngineData>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match (self.0.next)(self.0.state) {
+        match (self.iter.next)(self.iter.state) {
             CNextEngineData::Some(h) => Some(Ok(unsafe { h.into_inner() })),
             CNextEngineData::None => None,
             CNextEngineData::Err(h) => {
@@ -165,24 +202,23 @@ impl Iterator for FfiDataIter {
     }
 }
 
-impl Drop for FfiDataIter {
-    fn drop(&mut self) {
-        (self.0.free)(self.0.state);
-    }
-}
-
 // SAFETY: callers' contract requires the engine to provide thread-safe state/fn pointers
 // (mirrors `FfiPlanExecutor`).
 unsafe impl Send for FfiDataIter {}
 
-/// Drains a [`CBytesIterator`] as a Rust iterator of [`Bytes`] buffers.
-struct FfiBytesIter(CBytesIterator);
+/// Drains a [`CBytesIterator`] as a Rust iterator of [`Bytes`] buffers. Cleanup of the
+/// underlying iterator state is handled by the embedded [`PlanResultCleanup`] when the
+/// iterator is dropped.
+struct FfiBytesIter {
+    iter: CBytesIterator,
+    _cleanup: PlanResultCleanup,
+}
 
 impl Iterator for FfiBytesIter {
     type Item = DeltaResult<Bytes>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match (self.0.next)(self.0.state) {
+        match (self.iter.next)(self.iter.state) {
             CNextBytes::Some(raw) => Some(Ok(Bytes::from_owner(raw))),
             CNextBytes::None => None,
             CNextBytes::Err(h) => {
@@ -190,12 +226,6 @@ impl Iterator for FfiBytesIter {
                 Some(Err(Error::generic(*s)))
             }
         }
-    }
-}
-
-impl Drop for FfiBytesIter {
-    fn drop(&mut self) {
-        (self.0.free)(self.0.state);
     }
 }
 
@@ -222,12 +252,28 @@ impl PlanExecutor for FfiPlanExecutor {
         // SAFETY: `bytes` is owned by this stack frame and outlives the callback invocation.
         // The callback contract forbids retaining the slice past the call.
         let slice = unsafe { KernelBytesSlice::new_unsafe(&bytes) };
-        match (self.callback)(self.context, slice) {
-            CPlanResult::Unit => Ok(PlanResult::Unit),
-            CPlanResult::Data(it) => Ok(PlanResult::Data(Box::new(FfiDataIter(it)))),
-            CPlanResult::Bytes(it) => Ok(PlanResult::ByteStream(Box::new(FfiBytesIter(it)))),
+        let CPlanResultWrapper {
+            result,
+            state,
+            free,
+        } = (self.callback)(self.context, slice);
+        let cleanup = PlanResultCleanup { state, free };
+        match result {
+            CPlanResult::Unit => {
+                drop(cleanup);
+                Ok(PlanResult::Unit)
+            }
+            CPlanResult::Data(it) => Ok(PlanResult::Data(Box::new(FfiDataIter {
+                iter: it,
+                _cleanup: cleanup,
+            }))),
+            CPlanResult::Bytes(it) => Ok(PlanResult::ByteStream(Box::new(FfiBytesIter {
+                iter: it,
+                _cleanup: cleanup,
+            }))),
             CPlanResult::Err(h) => {
                 let s = unsafe { h.into_inner() };
+                drop(cleanup);
                 Err(Error::generic(*s))
             }
         }
@@ -321,6 +367,24 @@ mod tests {
         (0..col.len()).map(|i| col.value(i)).collect()
     }
 
+    // === Common test free fns ===
+
+    /// No-op wrapper-level free for tests that don't need to observe cleanup.
+    extern "C" fn noop_free(_state: NullableCvoid) {}
+
+    /// Wrapper-level free that interprets `state` as a strong `Arc<AtomicBool>` reference
+    /// (from `Arc::into_raw`). Reconstructs the Arc (releasing the strong count) and
+    /// flips the bool to `true` so the test can observe via a sibling clone that cleanup
+    /// ran.
+    extern "C" fn flag_free(state: NullableCvoid) {
+        let raw = state.unwrap().as_ptr() as *const AtomicBool;
+        // SAFETY: each call site allocates the AtomicBool via `Arc::into_raw` and arranges
+        // for `flag_free` to be invoked exactly once with the corresponding raw pointer.
+        let flag = unsafe { Arc::from_raw(raw) };
+        flag.store(true, Ordering::SeqCst);
+        drop(flag);
+    }
+
     // === Existing test: callback receives valid proto, returns Unit ===
 
     struct CallbackProbe {
@@ -331,13 +395,17 @@ mod tests {
     extern "C" fn record_callback(
         context: NullableCvoid,
         plan_proto: KernelBytesSlice,
-    ) -> CPlanResult {
+    ) -> CPlanResultWrapper {
         let probe = unsafe { &*(context.unwrap().as_ptr() as *const CallbackProbe) };
         probe.invoked.store(true, Ordering::SeqCst);
         probe.last_plan_len.store(plan_proto.len, Ordering::SeqCst);
         let bytes = unsafe { std::slice::from_raw_parts(plan_proto.ptr, plan_proto.len) };
         let _ = proto::decode_plan(bytes).expect("callback received valid proto");
-        CPlanResult::Unit
+        CPlanResultWrapper {
+            result: CPlanResult::Unit,
+            state: None,
+            free: noop_free,
+        }
     }
 
     #[test]
@@ -385,8 +453,9 @@ mod tests {
 
     extern "C" fn data_iter_free(state: NullableCvoid) {
         let raw = state.unwrap().as_ptr() as *mut DataIterState;
-        // SAFETY: `data_iter_free` is called exactly once by `FfiDataIter::drop`, after
-        // which the state pointer is dead. Reconstructing the Box releases the state.
+        // SAFETY: `data_iter_free` is called exactly once via the `CPlanResultWrapper`'s
+        // `free` callback (driven by `FfiDataIter`'s embedded `PlanResultCleanup` on drop),
+        // after which the state pointer is dead. Reconstructing the Box releases the state.
         let state = unsafe { Box::from_raw(raw) };
         state.free_called.store(true, Ordering::SeqCst);
         drop(state);
@@ -395,13 +464,18 @@ mod tests {
     extern "C" fn data_callback(
         context: NullableCvoid,
         _plan_proto: KernelBytesSlice,
-    ) -> CPlanResult {
-        // Context here _is_ the iterator state pointer (no extra wrapper needed).
-        CPlanResult::Data(CEngineDataIterator {
+    ) -> CPlanResultWrapper {
+        // Context here _is_ the iterator state pointer; we share it with the wrapper's
+        // free callback so the iterator's state is released exactly once when the kernel
+        // drops the `PlanResult::Data` iterator.
+        CPlanResultWrapper {
+            result: CPlanResult::Data(CEngineDataIterator {
+                state: context,
+                next: data_iter_next,
+            }),
             state: context,
-            next: data_iter_next,
             free: data_iter_free,
-        })
+        }
     }
 
     #[test]
@@ -488,7 +562,8 @@ mod tests {
 
     extern "C" fn bytes_iter_free(state: NullableCvoid) {
         let raw = state.unwrap().as_ptr() as *mut BytesIterState;
-        // SAFETY: `bytes_iter_free` is called exactly once by `FfiBytesIter::drop`.
+        // SAFETY: `bytes_iter_free` is called exactly once via the `CPlanResultWrapper`'s
+        // `free` callback (driven by `FfiBytesIter`'s embedded `PlanResultCleanup` on drop).
         let state = unsafe { Box::from_raw(raw) };
         state.free_called.store(true, Ordering::SeqCst);
         drop(state);
@@ -497,12 +572,15 @@ mod tests {
     extern "C" fn bytes_callback(
         context: NullableCvoid,
         _plan_proto: KernelBytesSlice,
-    ) -> CPlanResult {
-        CPlanResult::Bytes(CBytesIterator {
+    ) -> CPlanResultWrapper {
+        CPlanResultWrapper {
+            result: CPlanResult::Bytes(CBytesIterator {
+                state: context,
+                next: bytes_iter_next,
+            }),
             state: context,
-            next: bytes_iter_next,
             free: bytes_iter_free,
-        })
+        }
     }
 
     #[test]
@@ -555,9 +633,9 @@ mod tests {
     // === Error variant test ===
 
     extern "C" fn error_callback(
-        _context: NullableCvoid,
+        context: NullableCvoid,
         _plan_proto: KernelBytesSlice,
-    ) -> CPlanResult {
+    ) -> CPlanResultWrapper {
         let msg = "boom";
         let handle = unsafe {
             ok_or_panic(allocate_kernel_string(
@@ -565,13 +643,21 @@ mod tests {
                 allocate_err,
             ))
         };
-        CPlanResult::Err(handle)
+        CPlanResultWrapper {
+            result: CPlanResult::Err(handle),
+            state: context,
+            free: flag_free,
+        }
     }
 
     #[test]
     fn error_variant_surfaces_to_kernel() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let raw = Arc::into_raw(flag.clone());
+        let context = NonNull::new(raw as *mut c_void);
+
         let executor = FfiPlanExecutor {
-            context: None,
+            context,
             callback: error_callback,
         };
 
@@ -581,5 +667,43 @@ mod tests {
             .expect_err("execute_plan should fail with Err callback");
         let msg = format!("{err}");
         assert!(msg.contains("boom"), "expected 'boom' in error: {msg}");
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "wrapper-level free should have fired for the Err variant"
+        );
+    }
+
+    // === Unit variant invokes wrapper free ===
+
+    extern "C" fn unit_free_callback(
+        context: NullableCvoid,
+        _plan_proto: KernelBytesSlice,
+    ) -> CPlanResultWrapper {
+        CPlanResultWrapper {
+            result: CPlanResult::Unit,
+            state: context,
+            free: flag_free,
+        }
+    }
+
+    #[test]
+    fn unit_variant_invokes_wrapper_free() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let raw = Arc::into_raw(flag.clone());
+        let context = NonNull::new(raw as *mut c_void);
+
+        let executor = FfiPlanExecutor {
+            context,
+            callback: unit_free_callback,
+        };
+        let url = url::Url::parse("memory:///u/").unwrap();
+        let result = executor
+            .execute_plan(DeclarativePlanNode::FileListing { url })
+            .expect("execute_plan succeeds when callback returns Unit");
+        assert!(matches!(result, PlanResult::Unit));
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "wrapper-level free should have fired for the Unit variant"
+        );
     }
 }

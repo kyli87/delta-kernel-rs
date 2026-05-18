@@ -1517,19 +1517,27 @@ mod tests {
         use std::ptr::NonNull;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        use crate::plan::executor::{get_ffi_plan_executor, CPlanResult, SharedPlanExecutor};
+        use crate::plan::executor::{
+            get_ffi_plan_executor, CPlanResult, CPlanResultWrapper, SharedPlanExecutor,
+        };
 
         struct Probe {
             invocations: AtomicUsize,
         }
 
+        extern "C" fn noop_free(_state: NullableCvoid) {}
+
         extern "C" fn record_callback(
             context: NullableCvoid,
             _plan_proto: KernelBytesSlice,
-        ) -> CPlanResult {
+        ) -> CPlanResultWrapper {
             let probe = unsafe { &*(context.unwrap().as_ptr() as *const Probe) };
             probe.invocations.fetch_add(1, Ordering::SeqCst);
-            CPlanResult::Unit
+            CPlanResultWrapper {
+                result: CPlanResult::Unit,
+                state: None,
+                free: noop_free,
+            }
         }
 
         let probe = Box::new(Probe {
