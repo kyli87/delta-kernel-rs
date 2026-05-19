@@ -20,7 +20,7 @@ pub mod naive;
 pub mod parquet;
 pub mod storage;
 
-pub use engine::PlanBasedEngine;
+pub use engine::{PlanBasedEngine, PlanBasedEngineBuilder};
 pub use json::PlanBasedJsonHandler;
 pub use naive::NaivePlanExecutor;
 pub use parquet::PlanBasedParquetHandler;

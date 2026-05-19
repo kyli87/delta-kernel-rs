@@ -22,6 +22,9 @@ tracing = "0.1"
 tracing-core = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", optional = true, features = [ "json" ] }
 url = "2"
+bytes = { version = "1.10", optional = true }
+prost = { version = "0.13", optional = true }
+serde_json = { version = "1.0", optional = true }
 delta_kernel = { path = "../kernel", default-features = false, features = [
   "internal-api",
 ] }
@@ -32,6 +35,7 @@ unity-catalog-delta-client-api = { path = "../unity-catalog-delta-client-api", o
 [build-dependencies]
 cbindgen = "0.29.2"
 libc = "0.2.175"
+prost-build = "0.13"
 
 [dev-dependencies]
 paste = "1.0"
@@ -57,7 +61,7 @@ arrow-57 = ["delta_kernel/arrow-57"]
 # This is an 'internal' feature flag which has all the shared bits from default-engine-native-tls and
 # default-engine-rustls. There is a check in kernel/lib.rs to ensure you have enabled one of
 # default-engine-native-tls or default-engine-rustls, so default-engine-base will not work by itself
-default-engine-base = ["delta_kernel/default-engine-base"]
+default-engine-base = ["delta_kernel/default-engine-base", "dep:bytes", "dep:prost", "dep:serde_json"]
 
 tracing = [ "tracing-core", "tracing-subscriber" ]
 internal-api = []

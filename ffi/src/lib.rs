@@ -53,6 +53,7 @@ pub mod expressions;
 #[cfg(feature = "tracing")]
 pub mod ffi_tracing;
 pub mod log_path;
+pub mod plan;
 pub mod scan;
 pub mod schema;
 pub mod schema_visitor;
@@ -139,6 +140,32 @@ impl KernelStringSlice {
         let source = source.as_bytes();
         Self {
             ptr: source.as_ptr().cast(),
+            len: source.len(),
+        }
+    }
+}
+
+/// A non-owned slice of raw bytes, intended for arg-passing between kernel and engine.
+///
+/// Like [`KernelStringSlice`], the pointed-to data must outlive the slice itself, and the slice
+/// must not be retained beyond the function call it was passed into.
+#[repr(C)]
+pub struct KernelBytesSlice {
+    ptr: *const u8,
+    len: usize,
+}
+
+impl KernelBytesSlice {
+    /// Create a new bytes slice from a source byte slice. This method is dangerous and can
+    /// easily lead to use-after-free scenarios -- the caller must ensure the source outlives the
+    /// returned slice.
+    ///
+    /// # Safety
+    ///
+    /// Caller affirms that the source will outlive the statement that creates this slice.
+    pub(crate) unsafe fn new_unsafe(source: &[u8]) -> Self {
+        Self {
+            ptr: source.as_ptr(),
             len: source.len(),
         }
     }
@@ -482,6 +509,11 @@ pub struct EngineBuilder {
     /// Configuration for multithreaded executor. If Some, use a multi-threaded executor
     /// If None, use the default single-threaded background executor.
     multithreaded_executor_config: Option<MultithreadedExecutorConfig>,
+    /// If `Some`, [`builder_build`] produces a
+    /// [`PlanBasedEngine`](delta_kernel::engine::plan::PlanBasedEngine) routing storage and
+    /// file-read operations through this executor; otherwise it produces a
+    /// [`DefaultEngine`](delta_kernel::engine::default::DefaultEngine).
+    plan_executor: Option<Arc<dyn delta_kernel::plan::PlanExecutor>>,
 }
 
 #[cfg(feature = "default-engine-base")]
@@ -525,6 +557,7 @@ fn get_engine_builder_impl(
         allocate_fn,
         options: HashMap::default(),
         multithreaded_executor_config: None,
+        plan_executor: None,
     });
     Ok(Box::into_raw(builder))
 }
@@ -582,10 +615,41 @@ pub unsafe extern "C" fn set_builder_with_multithreaded_executor(
     });
 }
 
-/// Consume the builder and return a `default` engine. After calling, the passed pointer is _no
+/// Configure the builder with a [`PlanExecutor`](delta_kernel::plan::PlanExecutor) so that
+/// [`builder_build`] produces a
+/// [`PlanBasedEngine`](delta_kernel::engine::plan::PlanBasedEngine) instead of the default
+/// engine. Storage and file-read operations are routed through the plan executor; expression
+/// evaluation and non-read operations (JSON parse/write, parquet write/footer read) still use
+/// the default Arrow-based handlers.
+///
+/// This consumes the executor handle.
+///
+/// # Safety
+///
+/// Caller must pass a valid EngineBuilder pointer and a valid
+/// [`SharedPlanExecutor`](crate::plan::executor::SharedPlanExecutor) handle obtained from
+/// [`get_ffi_plan_executor`](crate::plan::executor::get_ffi_plan_executor) (or any other
+/// future producer of `SharedPlanExecutor`).
+#[cfg(feature = "default-engine-base")]
+#[no_mangle]
+pub unsafe extern "C" fn set_builder_plan_executor(
+    builder: &mut EngineBuilder,
+    plan_executor: Handle<crate::plan::executor::SharedPlanExecutor>,
+) {
+    let executor: Arc<crate::plan::executor::FfiPlanExecutor> =
+        unsafe { plan_executor.clone_as_arc() };
+    // SAFETY: drop the original handle now that we've cloned the Arc.
+    unsafe { plan_executor.drop_handle() };
+    builder.plan_executor = Some(executor as Arc<dyn delta_kernel::plan::PlanExecutor>);
+}
+
+/// Consume the builder and return an engine. After calling, the passed pointer is _no
 /// longer valid_. Note that this _consumes_ and frees the builder, so there is no need to
 /// drop/free it afterwards.
 ///
+/// If a plan executor was set via [`set_builder_plan_executor`], the returned engine is a
+/// [`PlanBasedEngine`](delta_kernel::engine::plan::PlanBasedEngine); otherwise it is a
+/// [`DefaultEngine`](delta_kernel::engine::default::DefaultEngine).
 ///
 /// # Safety
 ///
@@ -596,10 +660,11 @@ pub unsafe extern "C" fn builder_build(
     builder: *mut EngineBuilder,
 ) -> ExternResult<Handle<SharedExternEngine>> {
     let builder_box = unsafe { Box::from_raw(builder) };
-    get_default_engine_impl(
+    build_engine_impl(
         builder_box.url,
         builder_box.options,
         builder_box.multithreaded_executor_config,
+        builder_box.plan_executor,
         builder_box.allocate_fn,
     )
     .into_extern_result(&builder_box.allocate_fn)
@@ -624,7 +689,7 @@ fn get_default_default_engine_impl(
     url: DeltaResult<Url>,
     allocate_error: AllocateErrorFn,
 ) -> DeltaResult<Handle<SharedExternEngine>> {
-    get_default_engine_impl(url?, Default::default(), None, allocate_error)
+    build_engine_impl(url?, Default::default(), None, None, allocate_error)
 }
 
 /// Safety
@@ -642,34 +707,52 @@ fn engine_to_handle(
     engine.into()
 }
 
-/// Build the default engine
+/// Build a [`DefaultEngine`](delta_kernel::engine::default::DefaultEngine) or
+/// [`PlanBasedEngine`](delta_kernel::engine::plan::PlanBasedEngine).
 ///
 /// If `executor_config` is `Some`, uses a multi-threaded executor that owns its runtime. Otherwise,
-/// uses the default single-threaded background executor.
+/// uses the default single-threaded background executor. If `plan_executor` is `Some`, the
+/// returned engine is a [`PlanBasedEngine`] backed by it; otherwise it is a [`DefaultEngine`].
 #[cfg(feature = "default-engine-base")]
-fn get_default_engine_impl(
+fn build_engine_impl(
     url: Url,
     options: HashMap<String, String>,
     executor_config: Option<MultithreadedExecutorConfig>,
+    plan_executor: Option<Arc<dyn delta_kernel::plan::PlanExecutor>>,
     allocate_error: AllocateErrorFn,
 ) -> DeltaResult<Handle<SharedExternEngine>> {
     use delta_kernel::engine::default::storage::store_from_url_opts;
     use delta_kernel::engine::default::DefaultEngineBuilder;
+    use delta_kernel::engine::plan::PlanBasedEngineBuilder;
 
     let store = store_from_url_opts(&url, options)?;
 
-    let engine: Arc<dyn Engine> = if let Some(config) = executor_config {
-        let executor = TokioMultiThreadExecutor::new_owned_runtime(
-            config.worker_threads,
-            config.max_blocking_threads,
-        )?;
-        Arc::new(
-            DefaultEngineBuilder::new(store)
-                .with_task_executor(Arc::new(executor))
+    let task_executor = match executor_config {
+        Some(config) => {
+            let executor = TokioMultiThreadExecutor::new_owned_runtime(
+                config.worker_threads,
+                config.max_blocking_threads,
+            )?;
+            Some(Arc::new(executor))
+        }
+        None => None,
+    };
+
+    let engine: Arc<dyn Engine> = match (plan_executor, task_executor) {
+        (Some(plan_executor), Some(task_executor)) => Arc::new(
+            PlanBasedEngineBuilder::new(store, plan_executor)
+                .with_task_executor(task_executor)
                 .build(),
-        )
-    } else {
-        Arc::new(DefaultEngineBuilder::new(store).build())
+        ),
+        (Some(plan_executor), None) => {
+            Arc::new(PlanBasedEngineBuilder::new(store, plan_executor).build())
+        }
+        (None, Some(task_executor)) => Arc::new(
+            DefaultEngineBuilder::new(store)
+                .with_task_executor(task_executor)
+                .build(),
+        ),
+        (None, None) => Arc::new(DefaultEngineBuilder::new(store).build()),
     };
 
     Ok(engine_to_handle(engine, allocate_error))
@@ -1425,6 +1508,75 @@ mod tests {
         unsafe {
             free_engine(engine);
         }
+    }
+
+    #[cfg(feature = "default-engine-base")]
+    #[test]
+    fn engine_builder_with_plan_executor() {
+        use std::ffi::c_void;
+        use std::ptr::NonNull;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::plan::executor::{
+            get_ffi_plan_executor, CPlanResult, CPlanResultWrapper, SharedPlanExecutor,
+        };
+
+        struct Probe {
+            invocations: AtomicUsize,
+        }
+
+        extern "C" fn noop_free(_state: NullableCvoid) {}
+
+        extern "C" fn record_callback(
+            context: NullableCvoid,
+            _plan_proto: KernelBytesSlice,
+        ) -> CPlanResultWrapper {
+            let probe = unsafe { &*(context.unwrap().as_ptr() as *const Probe) };
+            probe.invocations.fetch_add(1, Ordering::SeqCst);
+            CPlanResultWrapper {
+                result: CPlanResult::Unit,
+                state: None,
+                free: noop_free,
+            }
+        }
+
+        let probe = Box::new(Probe {
+            invocations: AtomicUsize::new(0),
+        });
+        let probe_ptr = Box::into_raw(probe);
+        let context = NonNull::new(probe_ptr as *mut c_void);
+
+        let exec: Handle<SharedPlanExecutor> =
+            unsafe { get_ffi_plan_executor(context, record_callback) };
+
+        let path = "memory:///plan_engine_test/";
+        let path_slice = kernel_string_slice!(path);
+        let builder = unsafe { ok_or_panic(get_engine_builder(path_slice, allocate_err)) };
+        unsafe { set_builder_plan_executor(builder.as_mut().unwrap(), exec) };
+        let engine = unsafe { ok_or_panic(builder_build(builder)) };
+
+        // Trigger a FileListing plan node by going through the storage handler. Our stub
+        // callback returns `Unit`, which the PlanBasedStorageHandler then surfaces as an
+        // error (it expected `Data`). That confirms the engine handle resolves to a
+        // `PlanBasedEngine` rather than the default engine.
+        let extern_engine = unsafe { engine.as_ref() };
+        let url = Url::parse(path).unwrap();
+        let result = extern_engine.engine().storage_handler().list_from(&url);
+        let err = result
+            .err()
+            .expect("list_from should fail with stub callback");
+        assert!(
+            format!("{err:?}").contains("expected PlanResult::Data"),
+            "expected the plan-based handler error, got: {err:?}"
+        );
+
+        let probe = unsafe { Box::from_raw(probe_ptr) };
+        assert!(
+            probe.invocations.load(Ordering::SeqCst) >= 1,
+            "plan executor callback should have been invoked"
+        );
+
+        unsafe { free_engine(engine) };
     }
 
     #[tokio::test]

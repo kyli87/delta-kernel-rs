@@ -17,9 +17,26 @@ fn get_target_dir(manifest_dir: &str) -> PathBuf {
     }
 }
 
+fn compile_protos(crate_dir: &str) {
+    // The proto module is only consumed under the `default-engine-base` feature, but we always
+    // generate the Rust bindings so that turning on/off features doesn't trigger extra rebuilds
+    // of the generated file.
+    let proto_path = Path::new(crate_dir)
+        .join("proto")
+        .join("declarative_plan_node.proto");
+    let proto_dir = Path::new(crate_dir).join("proto");
+    println!("cargo:rerun-if-changed={}", proto_path.display());
+    prost_build::Config::new()
+        .compile_protos(&[proto_path.as_path()], &[proto_dir.as_path()])
+        .expect("failed to compile declarative_plan_node.proto");
+}
+
 fn main() {
     let crate_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR should be set");
     let package_name = env::var("CARGO_PKG_NAME").expect("CARGO_PKG_NAME should be set");
+
+    compile_protos(&crate_dir);
+
     let target_dir = get_target_dir(crate_dir.as_str());
     let cbindgen_toml = Path::new(&crate_dir).join("cbindgen.toml");
     let mut config = Config::from_file(&cbindgen_toml)
