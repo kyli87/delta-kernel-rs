@@ -163,6 +163,25 @@ pub type CExecutePlan =
 // Rust-side adapters
 // ============================================================================
 
+/// Convert an engine-provided error message into a kernel [`Error`].
+///
+/// Engines (notably the Java/JVM engine) currently surface exceptions across this FFI
+/// boundary as opaque strings. As a short-term workaround until the engine can carry
+/// structured error information, we sniff the message for well-known exception class
+/// names and map them to typed kernel errors. Today only `NoSuchFileException` is
+/// recognized -- it maps to [`Error::FileNotFound`] so that kernel code paths which
+/// branch on `FileNotFound` (e.g. snapshot loading retry logic) behave correctly when
+/// the engine reports a missing file.
+fn engine_error_from_message(msg: String) -> Error {
+    // Java's `java.nio.file.NoSuchFileException` (and similar `*NoSuchFileException`
+    // subclasses) indicate a missing file. The full exception text typically includes
+    // both the class name and the path.
+    if msg.contains("NoSuchFileException") {
+        return Error::FileNotFound(msg);
+    }
+    Error::generic(msg)
+}
+
 /// RAII guard that invokes [`CPlanResultWrapper::free`] exactly once on drop, releasing all
 /// engine-side state associated with a plan result (including iterator state and any
 /// transitively referenced buffers).
@@ -196,7 +215,7 @@ impl Iterator for FfiDataIter {
             CNextEngineData::None => None,
             CNextEngineData::Err(h) => {
                 let s = unsafe { h.into_inner() };
-                Some(Err(Error::generic(*s)))
+                Some(Err(engine_error_from_message(*s)))
             }
         }
     }
@@ -223,7 +242,7 @@ impl Iterator for FfiBytesIter {
             CNextBytes::None => None,
             CNextBytes::Err(h) => {
                 let s = unsafe { h.into_inner() };
-                Some(Err(Error::generic(*s)))
+                Some(Err(engine_error_from_message(*s)))
             }
         }
     }
@@ -274,7 +293,7 @@ impl PlanExecutor for FfiPlanExecutor {
             CPlanResult::Err(h) => {
                 let s = unsafe { h.into_inner() };
                 drop(cleanup);
-                Err(Error::generic(*s))
+                Err(engine_error_from_message(*s))
             }
         }
     }
@@ -668,9 +687,31 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains("boom"), "expected 'boom' in error: {msg}");
         assert!(
+            matches!(err, Error::Generic(_)),
+            "unrecognized engine errors should surface as Error::Generic, got: {err:?}"
+        );
+        assert!(
             flag.load(Ordering::SeqCst),
             "wrapper-level free should have fired for the Err variant"
         );
+    }
+
+    #[test]
+    fn engine_error_from_message_recognizes_no_such_file_exception() {
+        let msg = "java.nio.file.NoSuchFileException: s3://bucket/_delta_log/_last_checkpoint"
+            .to_string();
+        match engine_error_from_message(msg.clone()) {
+            Error::FileNotFound(path) => assert_eq!(path, msg),
+            other => panic!("expected Error::FileNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn engine_error_from_message_defaults_to_generic() {
+        match engine_error_from_message("something else went wrong".to_string()) {
+            Error::Generic(m) => assert_eq!(m, "something else went wrong"),
+            other => panic!("expected Error::Generic, got {other:?}"),
+        }
     }
 
     // === Unit variant invokes wrapper free ===
