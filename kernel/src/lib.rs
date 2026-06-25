@@ -98,6 +98,7 @@ pub mod engine_data;
 pub mod error;
 pub mod expressions;
 pub mod incremental_scan;
+pub mod index;
 mod log_compaction;
 mod log_path;
 mod log_reader;
@@ -974,6 +975,16 @@ pub trait Engine: AsAny {
 
     /// Get the connector provided [`ParquetHandler`].
     fn parquet_handler(&self) -> Arc<dyn ParquetHandler>;
+
+    /// Get the connector provided [`IndexProvider`], if the engine supports table indexes.
+    ///
+    /// Returns `None` by default, meaning the engine provides no index support and all index
+    /// optimizations are disabled (scans remain correct, just unaccelerated).
+    ///
+    /// [`IndexProvider`]: crate::index::IndexProvider
+    fn get_index_provider(&self) -> Option<Arc<dyn crate::index::IndexProvider>> {
+        None
+    }
 
     /// Get the connector provided [`PlanExecutor`].
     ///
