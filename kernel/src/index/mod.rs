@@ -18,14 +18,30 @@
 use std::collections::HashMap;
 use std::ops::Bound;
 
+// Disambiguated from the `serde` submodule below: `::serde` is the external crate (derive
+// macros), `self::serde` is this module's wire-format submodule.
+use ::serde::{Deserialize, Serialize};
+
 use crate::expressions::{ColumnName, Scalar};
 use crate::{AsAny, DeltaResult, EngineData, Version};
+
+mod serde;
+pub(crate) use self::serde::{parse_index_spec, serialize_index_configs, serialize_index_spec};
+
+/// Prefix for the system-controlled domain that records per-version state for an index named
+/// `<name>` (i.e. the full domain is `delta.index.<name>`).
+pub(crate) const INDEX_DOMAIN_PREFIX: &str = "delta.index.";
+
+/// Build the domain-metadata domain name for the index named `name`.
+pub(crate) fn index_domain_name(name: &str) -> String {
+    format!("{INDEX_DOMAIN_PREFIX}{name}")
+}
 
 /// Declarative configuration for a single index, as stored in the table's metadata.
 ///
 /// This mirrors one entry of the `delta.indexes` metadata property. It describes *what* the
 /// index is; it says nothing about the current contents of the index (see [`IndexSpec`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexConfig {
     /// Table-unique identifier for the index. Also the suffix of the index's state domain
     /// (`delta.index.<name>`).
@@ -42,7 +58,7 @@ pub struct IndexConfig {
 ///
 /// This mirrors the value of the `delta.index.<name>` domain. It is produced by an
 /// [`IndexWriter`] on close and consumed by an [`IndexReader`] on open.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexSpec {
     /// The table version up to which this index is valid. A reader may use the index only for
     /// data files present at or before this version; files added later must be read normally.
@@ -129,4 +145,15 @@ pub trait IndexReader: Send + Sync {
         start_bound: Bound<Scalar>,
         end_bound: Bound<Scalar>,
     ) -> DeltaResult<Box<dyn EngineData>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn index_domain_name_uses_prefix() {
+        assert_eq!(index_domain_name("idx"), "delta.index.idx");
+        assert!(index_domain_name("idx").starts_with(INDEX_DOMAIN_PREFIX));
+    }
 }

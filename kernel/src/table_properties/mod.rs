@@ -66,6 +66,7 @@ pub(crate) const IN_COMMIT_TIMESTAMP_ENABLEMENT_VERSION: &str =
     "delta.inCommitTimestampEnablementVersion";
 pub(crate) const IN_COMMIT_TIMESTAMP_ENABLEMENT_TIMESTAMP: &str =
     "delta.inCommitTimestampEnablementTimestamp";
+pub(crate) const INDEXES: &str = "delta.indexes";
 
 /// Delta table properties. These are parsed from the 'configuration' map in the most recent
 /// 'Metadata' action of a table.

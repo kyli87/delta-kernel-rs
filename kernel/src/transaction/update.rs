@@ -93,6 +93,7 @@ impl Transaction {
             commit_timestamp,
             user_domain_metadata_additions: vec![],
             system_domain_metadata_additions: vec![],
+            index_spec_additions: vec![],
             user_domain_removals: vec![],
             data_change: true,
             engine_commit_info: None,

@@ -166,6 +166,7 @@ impl CreateTableTransaction {
             commit_timestamp: current_time_ms()?,
             user_domain_metadata_additions: vec![],
             system_domain_metadata_additions: system_domain_metadata,
+            index_spec_additions: vec![],
             user_domain_removals: vec![],
             data_change: true,
             engine_commit_info: None,

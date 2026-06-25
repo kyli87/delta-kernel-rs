@@ -17,6 +17,7 @@ use crate::actions::{DomainMetadata, Metadata, Protocol};
 use crate::clustering::{create_clustering_domain_metadata, validate_clustering_columns};
 use crate::committer::Committer;
 use crate::expressions::ColumnName;
+use crate::index::{serialize_index_configs, IndexConfig};
 use crate::schema::validation::validate_schema;
 use crate::schema::variant_utils::schema_contains_variant_type;
 use crate::schema::{
@@ -35,9 +36,9 @@ use crate::table_properties::{
     COLUMN_MAPPING_MAX_COLUMN_ID, COLUMN_MAPPING_MODE, DELTA_PROPERTY_PREFIX,
     ENABLE_CHANGE_DATA_FEED, ENABLE_DELETION_VECTORS, ENABLE_ICEBERG_COMPAT_V1,
     ENABLE_ICEBERG_COMPAT_V2, ENABLE_ICEBERG_COMPAT_V3, ENABLE_IN_COMMIT_TIMESTAMPS,
-    ENABLE_ROW_TRACKING, ENABLE_TYPE_WIDENING, MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME,
-    MATERIALIZED_ROW_ID_COLUMN_NAME, PARQUET_FORMAT_VERSION, ROW_TRACKING_SUSPENDED,
-    SET_TRANSACTION_RETENTION_DURATION,
+    ENABLE_ROW_TRACKING, ENABLE_TYPE_WIDENING, INDEXES,
+    MATERIALIZED_ROW_COMMIT_VERSION_COLUMN_NAME, MATERIALIZED_ROW_ID_COLUMN_NAME,
+    PARQUET_FORMAT_VERSION, ROW_TRACKING_SUSPENDED, SET_TRANSACTION_RETENTION_DURATION,
 };
 use crate::transaction::create_table::CreateTableTransaction;
 use crate::transaction::data_layout::DataLayout;
@@ -86,6 +87,10 @@ const ALLOWED_DELTA_FEATURES: &[TableFeature] = &[
     // Dependent features (ColumnMapping, RowTracking, DomainMetadata) are auto-added during
     // create table.
     TableFeature::IcebergCompatV3,
+    // DataIndexes (experimental prototype) enables the generic table index machinery. The
+    // dependent DomainMetadata feature is auto-added when index configs are supplied via
+    // `with_index`.
+    TableFeature::DataIndexes,
 ];
 
 /// Delta properties allowed to be set during CREATE TABLE.
@@ -114,6 +119,9 @@ const ALLOWED_DELTA_PROPERTIES: &[&str] = &[
     // IcebergCompatV3 enablement: triggers auto-enablement of ColumnMapping,
     // RowTracking, DomainMetadata.
     ENABLE_ICEBERG_COMPAT_V3,
+    // Index definitions (experimental prototype). Normally populated by `with_index`, but a raw
+    // `delta.indexes` JSON value is also accepted.
+    INDEXES,
 ];
 
 /// Ensures that no Delta table exists at the given path.
@@ -757,6 +765,7 @@ pub struct CreateTableTransactionBuilder {
     engine_info: String,
     table_properties: HashMap<String, String>,
     data_layout: DataLayout,
+    indexes: Vec<IndexConfig>,
 }
 
 impl CreateTableTransactionBuilder {
@@ -771,6 +780,7 @@ impl CreateTableTransactionBuilder {
             engine_info: engine_info.into(),
             table_properties: HashMap::new(),
             data_layout: DataLayout::None,
+            indexes: Vec::new(),
         }
     }
 
@@ -858,6 +868,19 @@ impl CreateTableTransactionBuilder {
         self
     }
 
+    /// Declares a table index (experimental prototype).
+    ///
+    /// Each supplied [`IndexConfig`] is serialized into the `delta.indexes` table property at
+    /// [`build()`], and the `dataIndexes` writer feature (plus its `domainMetadata` dependency)
+    /// is enabled on the new table. May be called repeatedly to declare multiple indexes;
+    /// duplicate index names are rejected at [`build()`].
+    ///
+    /// [`build()`]: CreateTableTransactionBuilder::build
+    pub fn with_index(mut self, config: IndexConfig) -> Self {
+        self.indexes.push(config);
+        self
+    }
+
     /// Builds a [`CreateTableTransaction`] that can be committed to create the table.
     ///
     /// The returned [`CreateTableTransaction`] only exposes operations that are valid for
@@ -908,6 +931,38 @@ impl CreateTableTransactionBuilder {
         // - Removes feature signals from properties (they shouldn't be stored in metadata)
         // - Returns reader/writer features to add to protocol
         let mut validated = validate_extract_table_features_and_properties(self.table_properties)?;
+
+        // Index configs (experimental prototype): serialize into the `delta.indexes` property and
+        // enable the `dataIndexes` (+ `domainMetadata` dependency) writer features.
+        if !self.indexes.is_empty() {
+            if validated.properties.contains_key(INDEXES) {
+                return Err(Error::generic(format!(
+                    "Cannot set the '{INDEXES}' property directly when using with_index()"
+                )));
+            }
+            let mut seen_names = HashSet::new();
+            for config in &self.indexes {
+                if !seen_names.insert(config.name.as_str()) {
+                    return Err(Error::generic(format!(
+                        "Duplicate index name '{}'",
+                        config.name
+                    )));
+                }
+            }
+            validated
+                .properties
+                .insert(INDEXES.to_string(), serialize_index_configs(&self.indexes)?);
+            add_feature_to_lists(
+                TableFeature::DataIndexes,
+                &mut validated.reader_features,
+                &mut validated.writer_features,
+            );
+            add_feature_to_lists(
+                TableFeature::DomainMetadata,
+                &mut validated.reader_features,
+                &mut validated.writer_features,
+            );
+        }
 
         // When IcebergCompatV3 is enabled, fill in / validate required dependencies before
         // column mapping is applied so the CM mode is in place. The returned witness is

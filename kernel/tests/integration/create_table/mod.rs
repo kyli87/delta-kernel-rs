@@ -5,6 +5,7 @@ mod column_mapping;
 mod ctas;
 mod iceberg_compat;
 mod ict;
+mod index;
 mod partitioned;
 mod row_tracking;
 mod timestamp_ntz;

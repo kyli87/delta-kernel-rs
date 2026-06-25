@@ -63,6 +63,7 @@ impl AlterTableTransaction {
             commit_timestamp: current_time_ms()?,
             user_domain_metadata_additions: vec![],
             system_domain_metadata_additions: vec![],
+            index_spec_additions: vec![],
             user_domain_removals: vec![],
             data_change: false,
             engine_commit_info: None,

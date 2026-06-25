@@ -3,9 +3,10 @@ use std::collections::HashSet;
 use super::{EngineDataResultIterator, Transaction};
 use crate::actions::{get_log_domain_metadata_schema, DomainMetadata, INTERNAL_DOMAIN_PREFIX};
 use crate::error::Error;
+use crate::index::{index_domain_name, serialize_index_spec, INDEX_DOMAIN_PREFIX};
 use crate::row_tracking::{RowTrackingDomainMetadata, ROW_TRACKING_DOMAIN_NAME};
 use crate::table_features::TableFeature;
-use crate::{DeltaResult, Engine, IntoEngineData};
+use crate::{DeltaResult, Engine, IntoEngineData, Version};
 
 impl<S> Transaction<S> {
     /// Validate domain metadata operations for both create-table and existing-table transactions.
@@ -20,6 +21,7 @@ impl<S> Transaction<S> {
         // Feature validation (applies to all transactions with domain operations)
         let has_domain_ops = !self.system_domain_metadata_additions.is_empty()
             || !self.user_domain_metadata_additions.is_empty()
+            || !self.index_spec_additions.is_empty()
             || !self.user_domain_removals.is_empty();
 
         // Early return if no domain operations to validate
@@ -40,6 +42,7 @@ impl<S> Transaction<S> {
         let mut seen_domains = HashSet::with_capacity(
             self.system_domain_metadata_additions.len()
                 + self.user_domain_metadata_additions.len()
+                + self.index_spec_additions.len()
                 + self.user_domain_removals.len(),
         );
 
@@ -53,6 +56,23 @@ impl<S> Transaction<S> {
 
             // Check for duplicates
             if !seen_domains.insert(domain) {
+                return Err(Error::generic(format!(
+                    "Metadata for domain {domain} already specified in this transaction"
+                )));
+            }
+        }
+
+        // Validate INDEX domain additions (via with_index_spec API). Each maps to a
+        // `delta.index.<name>` system domain gated by the DataIndexes feature.
+        let index_domains: Vec<String> = self
+            .index_spec_additions
+            .iter()
+            .map(|(name, _)| index_domain_name(name))
+            .collect();
+        for domain in &index_domains {
+            self.validate_system_domain_feature(domain)?;
+
+            if !seen_domains.insert(domain.as_str()) {
                 return Err(Error::generic(format!(
                     "Metadata for domain {domain} already specified in this transaction"
                 )));
@@ -120,6 +140,8 @@ impl<S> Transaction<S> {
             ROW_TRACKING_DOMAIN_NAME => Some(TableFeature::RowTracking),
             // Will be changed to a constant in a follow up clustering create table feature PR
             "delta.clustering" => Some(TableFeature::ClusteredTable),
+            // Per-index state domains (`delta.index.<name>`) are gated by DataIndexes.
+            _ if domain.starts_with(INDEX_DOMAIN_PREFIX) => Some(TableFeature::DataIndexes),
             _ => {
                 return Err(Error::generic(format!(
                     "Unknown system domain '{domain}'. Only known system domains are allowed."
@@ -192,6 +214,7 @@ impl<S> Transaction<S> {
         &'a self,
         engine: &'a dyn Engine,
         row_tracking_high_watermark: Option<RowTrackingDomainMetadata>,
+        commit_version: Version,
     ) -> DeltaResult<(EngineDataResultIterator<'a>, Vec<DomainMetadata>)> {
         let is_create = self.is_create_table();
 
@@ -212,12 +235,30 @@ impl<S> Transaction<S> {
             .transpose()?
             .into_iter();
 
-        // Chain all domain actions: system domains, row tracking, user domains, removals
+        // Generate index state domain actions. `covers_version` is stamped with the resolved
+        // commit version (overwriting any caller-provided value) so it stays consistent with the
+        // data committed in this transaction.
+        let index_domain_actions = self
+            .index_spec_additions
+            .iter()
+            .map(|(name, spec)| {
+                let mut spec = spec.clone();
+                spec.covers_version = commit_version;
+                Ok(DomainMetadata::new(
+                    index_domain_name(name),
+                    serialize_index_spec(&spec)?,
+                ))
+            })
+            .collect::<DeltaResult<Vec<_>>>()?;
+
+        // Chain all domain actions: system domains, row tracking, index domains, user domains,
+        // removals
         let dm_actions_vec: Vec<DomainMetadata> = self
             .system_domain_metadata_additions
             .iter()
             .cloned()
             .chain(row_tracking_domain_action)
+            .chain(index_domain_actions)
             .chain(self.user_domain_metadata_additions.iter().cloned())
             .chain(removal_actions)
             .collect();

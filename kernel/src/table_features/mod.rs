@@ -132,6 +132,10 @@ pub(crate) enum TableFeature {
     /// TODO(#2630): column-defaults is not fully supported yet. Kernel support is gated by
     /// the `column-defaults-in-dev` cargo feature.
     AllowColumnDefaults,
+    /// Generic table indexes (experimental prototype). Declares that the table may carry index
+    /// definitions in the `delta.indexes` property and per-version index state in
+    /// `delta.index.<name>` domain metadata.
+    DataIndexes,
 
     ///////////////////////////
     // ReaderWriter features //
@@ -479,6 +483,17 @@ static CLUSTERED_TABLE_INFO: FeatureInfo = FeatureInfo {
     enablement_check: EnablementCheck::AlwaysIfSupported,
 };
 
+// Experimental prototype feature. Index maintenance is a writer concern; a reader that ignores
+// indexes is still correct (it just scans more), so this is writer-only. Requires DomainMetadata
+// because per-version index state is recorded in `delta.index.<name>` domains.
+static DATA_INDEXES_INFO: FeatureInfo = FeatureInfo {
+    feature_type: FeatureType::WriterOnly,
+    min_legacy_version: None,
+    feature_requirements: &[FeatureRequirement::Supported(TableFeature::DomainMetadata)],
+    kernel_support: KernelSupport::Supported,
+    enablement_check: EnablementCheck::AlwaysIfSupported,
+};
+
 static MATERIALIZE_PARTITION_COLUMNS_INFO: FeatureInfo = FeatureInfo {
     feature_type: FeatureType::WriterOnly,
     min_legacy_version: None,
@@ -684,6 +699,7 @@ impl TableFeature {
             | TableFeature::ClusteredTable
             | TableFeature::MaterializePartitionColumns => FeatureType::WriterOnly,
             TableFeature::AllowColumnDefaults => FeatureType::WriterOnly,
+            TableFeature::DataIndexes => FeatureType::WriterOnly,
             TableFeature::Unknown(_) => FeatureType::Unknown,
         }
     }
@@ -720,6 +736,7 @@ impl TableFeature {
             TableFeature::ClusteredTable => &CLUSTERED_TABLE_INFO,
             TableFeature::MaterializePartitionColumns => &MATERIALIZE_PARTITION_COLUMNS_INFO,
             TableFeature::AllowColumnDefaults => &ALLOW_COLUMN_DEFAULTS_INFO,
+            TableFeature::DataIndexes => &DATA_INDEXES_INFO,
 
             // ReaderWriter features
             TableFeature::CatalogManaged => &CATALOG_MANAGED_INFO,
@@ -997,6 +1014,7 @@ mod tests {
                 TableFeature::VariantShredding => "variantShredding",
                 TableFeature::VariantShreddingPreview => "variantShredding-preview",
                 TableFeature::AllowColumnDefaults => "allowColumnDefaults",
+                TableFeature::DataIndexes => "dataIndexes",
                 TableFeature::Unknown(_) => continue, // tested in test_unknown_features
             };
 

@@ -21,6 +21,7 @@ use crate::crc::{
 };
 use crate::expressions::ColumnName;
 use crate::incremental_scan::IncrementalScanBuilder;
+use crate::index::{index_domain_name, parse_index_spec, IndexSpec};
 use crate::log_segment::{DomainMetadataMap, LogSegment};
 use crate::metrics::events::{DOMAIN_METADATA_LOADED_SPAN, SET_TRANSACTION_LOADED_SPAN};
 use crate::metrics::SnapshotLoadMetricContext;
@@ -465,6 +466,20 @@ impl Snapshot {
         }
 
         self.get_domain_metadata_internal(domain, engine)
+    }
+
+    /// Fetch the latest [`IndexSpec`] for the index named `name` (experimental prototype).
+    ///
+    /// Reads the reconciled `delta.index.<name>` system domain metadata and parses it. Returns
+    /// `Ok(None)` if no such index state has been committed.
+    ///
+    /// Note that this method performs log replay (fetches and processes metadata from storage).
+    pub fn index_spec(&self, name: &str, engine: &dyn Engine) -> DeltaResult<Option<IndexSpec>> {
+        let domain = index_domain_name(name);
+        match self.get_domain_metadata_internal(&domain, engine)? {
+            Some(config) => Ok(Some(parse_index_spec(&config)?)),
+            None => Ok(None),
+        }
     }
 
     /// Get the logical clustering columns for this snapshot, if clustering is enabled.

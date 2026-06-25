@@ -23,6 +23,7 @@ use crate::expressions::UnaryExpressionOp::ToJson;
 use crate::expressions::{
     col, lit, ArrayData, ColumnName, ExpressionStructPatch, ExpressionStructPatchBuilder, Scalar,
 };
+use crate::index::IndexSpec;
 use crate::log_segment::LogSegment;
 use crate::metrics::events::TRANSACTION_COMMIT_SPAN;
 use crate::metrics::{CommitFailureReason, MetricId};
@@ -245,6 +246,10 @@ pub struct Transaction<S = ExistingTable> {
     // domain metadata is handled separately via `row_tracking_high_watermark` parameter in
     // `generate_domain_metadata_actions`. Consider unifying system domain handling.
     system_domain_metadata_additions: Vec<DomainMetadata>,
+    // Index specs to attach to this commit (via with_index_spec API), keyed by index name. Stored
+    // typed until commit so kernel stamps `covers_version` with the resolved commit version; each
+    // becomes a `delta.index.<name>` system domain metadata action.
+    index_spec_additions: Vec<(String, IndexSpec)>,
     // Domain names to remove in this transaction. The configuration values are fetched during
     // commit from the log to preserve the pre-image in tombstones.
     user_domain_removals: Vec<String>,
@@ -471,8 +476,11 @@ impl<S> Transaction<S> {
             self.generate_adds(engine, commit_version)?;
 
         // Step 4b: Generate all domain metadata actions (user and system domains)
-        let (domain_metadata_actions, dm_changes) =
-            self.generate_domain_metadata_actions(engine, row_tracking_domain_metadata)?;
+        let (domain_metadata_actions, dm_changes) = self.generate_domain_metadata_actions(
+            engine,
+            row_tracking_domain_metadata,
+            commit_version,
+        )?;
 
         // Step 5: Generate DV update actions (remove/add pairs) if any DV updates are present
         let dv_update_actions = self.generate_dv_update_actions(engine)?;
@@ -658,6 +666,19 @@ impl<S> Transaction<S> {
     pub fn with_domain_metadata(mut self, domain: String, configuration: String) -> Self {
         self.user_domain_metadata_additions
             .push(DomainMetadata::new(domain, configuration));
+        self
+    }
+
+    /// Attach an [`IndexSpec`] to this commit (experimental prototype).
+    ///
+    /// The spec is recorded atomically with the data as a `delta.index.<name>` system domain
+    /// metadata action. The table must support the `dataIndexes` writer feature, otherwise the
+    /// commit fails.
+    ///
+    /// The incoming `spec.covers_version` is ignored and overwritten at commit time with the
+    /// resolved commit version, so callers need not (and cannot) predict the committed version.
+    pub fn with_index_spec(mut self, name: impl Into<String>, spec: IndexSpec) -> Self {
+        self.index_spec_additions.push((name.into(), spec));
         self
     }
 
