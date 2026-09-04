@@ -1076,6 +1076,12 @@ impl Scan {
     ///
     /// Returns an error if the engine provides no [`PlanExecutor`](crate::plans::PlanExecutor),
     /// or if log discovery, checkpoint inspection, or plan construction fails.
+    #[tracing::instrument(
+        name = "scan.declarative_metadata_scan_plan",
+        skip_all,
+        fields(frame_profile),
+        err
+    )]
     pub fn declarative_metadata_scan_plan(&self, engine: &dyn Engine) -> DeltaResult<Option<Plan>> {
         // Resolve the checkpoint shape once: it selects the leaf-vs-manifest arm and reports
         // whether the checkpoint carries a compatible parsed-stats column.
