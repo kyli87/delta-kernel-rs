@@ -4,6 +4,9 @@
 //! snapshot creation, scans, and transactions. Metrics are collected during operations
 //! and reported as events via the `MetricsReporter` trait.
 //!
+//! [`FrameReporterLayer`] separately reports dynamic enter/exit notifications for tracing spans
+//! that opt in with [`FRAME_PROFILE_FIELD`]. It does not create or modify [`MetricEvent`]s.
+//!
 //! Each operation (Snapshot, Transaction, Scan) is assigned a unique operation ID ([`MetricId`])
 //! when it starts, and all subsequent events for that operation reference this ID.
 //! This allows reporters to correlate events and track operation lifecycles.
@@ -20,7 +23,10 @@
 //!     fn report(&self, event: MetricEvent) {
 //!         match event {
 //!             MetricEvent::LogSegmentLoadSuccess(e) => {
-//!                 println!("Log segment loaded in {:?}: {} commits", e.duration, e.num_commit_files);
+//!                 println!(
+//!                     "Log segment loaded in {:?}: {} commits",
+//!                     e.duration, e.num_commit_files
+//!                 );
 //!             }
 //!             MetricEvent::SnapshotBuildSuccess(e) => {
 //!                 println!("Snapshot completed: v{} in {:?}", e.version, e.duration);
@@ -73,6 +79,7 @@
 //! [`Engine`]: crate::Engine
 
 pub(crate) mod events;
+mod frame_reporter;
 mod metered_engine;
 mod metered_json;
 mod metered_parquet;
@@ -96,6 +103,7 @@ pub(crate) use events::{
     emit_log_segment_load, emit_log_segment_load_failure, emit_protocol_metadata_load,
     emit_protocol_metadata_load_failure,
 };
+pub use frame_reporter::{FrameReporter, FrameReporterLayer, FRAME_PROFILE_FIELD};
 pub use metered_engine::MeteredDeltaEngine;
 pub use metered_json::MeteredJsonHandler;
 pub use metered_parquet::MeteredParquetHandler;
