@@ -1,37 +1,54 @@
+mod actions;
 mod precommit;
+mod preparation;
 #[cfg(test)]
 mod test_utils;
+
+use std::sync::Arc;
 
 use precommit::{
     AddFileFieldsCheck, AppendOnlyCheck, CheckList, ClusteringStatsCheck, NumRecordsCheck,
     RemoveFileFieldsCheck,
 };
 
-use std::sync::Arc;
-use crate::actions::{Add, Remove};
-use crate::schema::{SchemaRef, ToSchema};
-
 use super::{CommitResult, Declarative, Transaction, UpdateTable};
+use crate::KernelResult;
 #[cfg(doc)]
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
-use crate::plans::{Operation, RelationRef, ScopedPlanExecutor};
+use crate::actions::{Add, Remove};
+use crate::metrics::events::TRANSACTION_COMMIT_SPAN;
+use crate::plans::{RelationRef, ScopedPlanExecutor};
 #[cfg(doc)]
 use crate::scan::scan_row_schema;
+use crate::schema::{SchemaRef, ToSchema};
 use crate::table_features::TableFeature;
-use crate::{KernelError, KernelResult};
 
 impl<S> Transaction<S, Declarative> {
     /// Consume the transaction and commit it to the table.
     ///
     /// See [`Transaction::commit`] for result semantics and validation requirements.
     /// The executor runs plans against staged relations, which must remain available in its scope.
+    #[tracing::instrument(
+        parent = &self.span,
+        name = TRANSACTION_COMMIT_SPAN,
+        skip_all,
+        fields(
+            report,
+            operation_id = %self.operation_id,
+            is_catalog_managed = self.effective_table_config.is_catalog_managed(),
+            correlation_id = self.correlation_id.as_deref().unwrap_or(""),
+            commit_version = self.get_commit_version(),
+            num_add_files, num_remove_files, num_dv_updates, add_files_bytes, remove_files_bytes,
+            is_blind_append, data_change, operation, prepare_duration_ns, committer_duration_ns,
+            failure_reason,
+        ),
+        err
+    )]
     pub fn commit_declarative(
         self,
-        _executor: &dyn ScopedPlanExecutor,
-    ) -> KernelResult<CommitResult<S, Declarative>> {
-        Err(KernelError::unsupported(
-            "Declarative transaction commits are not implemented",
-        ))
+        executor: &dyn ScopedPlanExecutor,
+    ) -> crate::Result<CommitResult<S, Declarative>> {
+        self.commit_prepared(executor)
     }
 
     /// Stages connector-prepared Add actions without rewriting physical metadata.
@@ -69,31 +86,6 @@ impl<S> Transaction<S, Declarative> {
     /// execute the relation or validate its rows.
     pub fn add_files_ref(&mut self, add_metadata: RelationRef) {
         self.staged_data_changes.add_files.push(add_metadata);
-    }
-
-    /// Performs validation against this transaction's staged file actions by executing a
-    /// declarative plan (containing the needed set of validations). See `precommit` module for
-    /// pla-based check logic.
-    #[allow(dead_code)]
-    fn validate_file_actions(&self, executor: &dyn ScopedPlanExecutor) -> KernelResult<()> {
-        // TODO: DV updates is not yet supported
-        if !self.staged_data_changes.dv_updates.is_empty() {
-            return Err(KernelError::unsupported(
-                "Declarative validation of staged DV updates",
-            ));
-        }
-
-        let checks = self.file_action_checks()?;
-        let plan = precommit::build_plan(
-            &self.staged_data_changes.add_files,
-            &self.staged_data_changes.remove_files,
-            &checks,
-            self.stats_schema()?.as_ref(),
-        )?;
-        let result = executor
-            .execute_op(Operation::QueryPlan(plan))?
-            .into_data()?;
-        precommit::validate_result(result, &checks)
     }
 
     /// Selects which pre-commit check should be run (based on the effective table configuration
