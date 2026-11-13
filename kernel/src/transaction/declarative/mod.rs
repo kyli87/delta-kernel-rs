@@ -55,6 +55,7 @@ impl<S> Transaction<S, Declarative> {
     ///
     /// The flat input schema is given by [`Self::add_actions_schema`]. Optional fields may be
     /// omitted. JSON statistics, tags, deletion vectors and assigned row IDs are preserved.
+    /// Deletion vector fields must satisfy [`DeletionVectorDescriptor::try_new`].
     pub fn add_actions_ref(&mut self, actions: RelationRef) {
         self.staged_data_changes.add_actions.push(actions);
     }
@@ -131,6 +132,7 @@ impl Transaction<UpdateTable, Declarative> {
     /// Stages connector-prepared Remove actions with the flat [`Self::remove_actions_schema`].
     /// Optional fields may be omitted. The connector's deletion timestamp, tags and row IDs are
     /// preserved, and the actions undergo the same pre-commit checks as generated actions.
+    /// Deletion vector fields must satisfy [`DeletionVectorDescriptor::try_new`].
     pub fn remove_actions_ref(&mut self, actions: RelationRef) {
         self.staged_data_changes.remove_actions.push(actions);
     }
@@ -163,6 +165,7 @@ impl Transaction<UpdateTable, Declarative> {
     ///
     /// Both relations must remain available in the executor passed to
     /// [`commit_declarative`](Self::commit_declarative) until commit completes.
+    /// New deletion vector fields must satisfy [`DeletionVectorDescriptor::try_new`].
     pub fn update_deletion_vectors_ref(
         &mut self,
         new_dv_descriptors: RelationRef,
