@@ -28,7 +28,7 @@ where
 /// field. Field names match the camelCase schema names produced by the `ToSchema` derive macro.
 /// The returned vec preserves CommitInfo schema field order, which callers rely on when
 /// inserting kernel-only fields after the last engine field.
-fn commit_info_literal_exprs(
+pub(super) fn commit_info_literal_exprs(
     commit_info: CommitInfo,
 ) -> KernelResult<Vec<(&'static str, ExpressionRef)>> {
     let string_map_type = MapType::new(DataType::STRING, DataType::STRING, true);
@@ -163,8 +163,8 @@ impl<STATE> Transaction<STATE, Imperative> {
 }
 
 #[derive(Default)]
-struct CommitInfoTagsVisitor {
-    tags: Option<HashMap<String, Option<String>>>,
+pub(super) struct CommitInfoTagsVisitor {
+    pub(super) tags: Option<HashMap<String, Option<String>>>,
 }
 
 impl RowVisitor for CommitInfoTagsVisitor {

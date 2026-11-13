@@ -6,9 +6,9 @@ use crate::committer::FileSystemCommitter;
 use crate::engine::sync::SyncEngine;
 use crate::engine::sync::plan::SyncPlanExecutor;
 use crate::expressions::{MapData, StructData};
+use crate::plans::PlanBuilder;
 use crate::scan::scan_row_schema;
-use crate::schema::{DataType, MapType};
-use crate::schema::{ToSchema, schema_ref};
+use crate::schema::{DataType, MapType, ToSchema, schema_ref};
 use crate::transaction::UpdateTableOperation;
 use crate::transaction::create_table::create_table;
 use crate::transaction::data_layout::DataLayout;
@@ -197,6 +197,171 @@ fn staged_add(
     )
 }
 
+#[rstest]
+fn create_append_remove_round_trip(#[values(false)] row_tracking: bool) -> Result<()> {
+    let dir = tempfile::tempdir().map_err(KernelError::from)?;
+    let engine = SyncEngine::new();
+    let executor = SyncPlanExecutor::default().get_scoped();
+    let mut create = create_table(
+        dir.path().to_string_lossy(),
+        schema_ref! { nullable "id": LONG },
+        "test",
+        true,
+    )
+    .with_table_properties([("delta.enableRowTracking", row_tracking.to_string())])
+    .with_execution_mode::<Declarative>()
+    .build(&engine, Box::new(FileSystemCommitter::new()))?;
+    create.add_files_ref(staged_add(&executor, "first.parquet", 3)?);
+    create.add_files_ref(staged_add(&executor, "second.parquet", 4)?);
+    let snapshot = create
+        .commit_declarative(&executor)?
+        .unwrap_post_commit_snapshot();
+    assert_eq!(snapshot.version(), 0);
+    assert_eq!(snapshot.get_file_stats_if_present().unwrap().num_files(), 2);
+    if row_tracking {
+        assert_eq!(
+            snapshot
+                .reader()
+                .get_row_tracking_high_water_mark(&engine)?,
+            Some(6)
+        );
+    }
+    let mut append = snapshot
+        .clone()
+        .update_table(UpdateTableOperation::Write, "test", true)
+        .with_execution_mode::<Declarative>()
+        .build(&engine, Box::new(FileSystemCommitter::new()))?;
+    append.add_files_ref(staged_add(&executor, "third.parquet", 5)?);
+    let snapshot = append
+        .commit_declarative(&executor)?
+        .unwrap_post_commit_snapshot();
+    assert_eq!(snapshot.version(), 1);
+    assert_eq!(snapshot.get_file_stats_if_present().unwrap().num_files(), 3);
+    if row_tracking {
+        assert_eq!(
+            snapshot
+                .reader()
+                .get_row_tracking_high_water_mark(&engine)?,
+            Some(11)
+        );
+    }
+    let remove_schema = schema_ref! {
+        nullable "path": STRING, nullable "size": LONG, nullable "dataChange": BOOLEAN,
+        nullable "deletionTimestamp": LONG, nullable "baseRowId": LONG,
+        nullable "defaultRowCommitVersion": LONG,
+    };
+    let reference = executor.execute_and_retain(
+        "remove",
+        crate::plans::PlanBuilder::values(
+            remove_schema,
+            vec![vec![
+                "first.parquet".into(),
+                100i64.into(),
+                true.into(),
+                123i64.into(),
+                if row_tracking {
+                    0i64.into()
+                } else {
+                    crate::expressions::Scalar::Null(DataType::LONG)
+                },
+                if row_tracking {
+                    0i64.into()
+                } else {
+                    crate::expressions::Scalar::Null(DataType::LONG)
+                },
+            ]],
+        )?
+        .build()?,
+    )?;
+    let mut remove = snapshot
+        .clone()
+        .update_table(UpdateTableOperation::Delete, "test", true)
+        .with_execution_mode::<Declarative>()
+        .build(&engine, Box::new(FileSystemCommitter::new()))?;
+    remove.ack_row_tracking_preservation();
+    remove.remove_actions_ref(reference);
+    let snapshot = remove
+        .commit_declarative(&executor)?
+        .unwrap_post_commit_snapshot();
+    assert_eq!(snapshot.version(), 2);
+    assert_eq!(snapshot.get_file_stats_if_present().unwrap().num_files(), 2);
+    let reloaded = crate::Snapshot::builder_for(snapshot.table_root().clone()).build(&engine)?;
+    assert_eq!(reloaded.version(), 2);
+    if row_tracking {
+        assert_eq!(
+            reloaded
+                .reader()
+                .get_row_tracking_high_water_mark(&engine)?,
+            Some(11)
+        );
+    }
+    Ok(())
+}
+
+#[rstest]
+#[case::duplicate("duplicate")]
+#[case::bad_size("negative")]
+#[case::append_only("append_only")]
+fn invalid_staging_does_not_write_a_commit(#[case] invalid: &str) -> Result<()> {
+    let dir = tempfile::tempdir().map_err(KernelError::from)?;
+    let engine = SyncEngine::new();
+    let executor = SyncPlanExecutor::default().get_scoped();
+    let snapshot = create_table(
+        dir.path().to_string_lossy(),
+        schema_ref! { nullable "id": LONG },
+        "test",
+        true,
+    )
+    .with_table_properties([("delta.appendOnly", (invalid == "append_only").to_string())])
+    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .commit(&engine)?
+    .unwrap_post_commit_snapshot();
+    let mut txn = snapshot
+        .update_table(UpdateTableOperation::Write, "test", true)
+        .with_execution_mode::<Declarative>()
+        .build(&engine, Box::new(FileSystemCommitter::new()))?;
+    match invalid {
+        "duplicate" => {
+            let reference = staged_add(&executor, "duplicate.parquet", 1)?;
+            txn.add_files_ref(reference.clone());
+            txn.add_files_ref(reference);
+        }
+        "negative" => {
+            let reference = staged_add(&executor, "negative.parquet", 1)?;
+            let plan =
+                crate::plans::PlanBuilder::relation_source(reference).project_patch(|p| {
+                    p.replace(
+                        "size",
+                        crate::schema::StructField::nullable("size", crate::DataType::LONG),
+                        crate::expressions::lit(-1i64),
+                    )
+                })?;
+            txn.add_files_ref(executor.execute_and_retain("invalid", plan.build()?)?);
+        }
+        "append_only" => {
+            let schema = schema_ref! { nullable "path": STRING, nullable "size": LONG, nullable "dataChange": BOOLEAN };
+            txn.remove_actions_ref(
+                executor.execute_and_retain(
+                    "remove",
+                    crate::plans::PlanBuilder::values(
+                        schema,
+                        vec![vec!["file.parquet".into(), 1i64.into(), true.into()]],
+                    )?
+                    .build()?,
+                )?,
+            );
+        }
+        _ => unreachable!(),
+    }
+    assert!(txn.commit_declarative(&executor).is_err());
+    assert!(
+        !dir.path()
+            .join("_delta_log/00000000000000000001.json")
+            .exists()
+    );
+    Ok(())
+}
+
 #[test]
 fn version_conflict_preserves_winning_commit() -> Result<()> {
     let dir = tempfile::tempdir().map_err(KernelError::from)?;
@@ -235,11 +400,113 @@ fn version_conflict_preserves_winning_commit() -> Result<()> {
 }
 
 #[test]
-fn create_and_append_round_trip() -> Result<()> {
+fn domain_transactions_and_commit_info_are_preserved() -> Result<()> {
     let dir = tempfile::tempdir().map_err(KernelError::from)?;
     let engine = SyncEngine::new();
     let executor = SyncPlanExecutor::default().get_scoped();
-    let mut create = create_table(
+    let snapshot = create_table(
+        dir.path().to_string_lossy(),
+        schema_ref! { nullable "id": LONG },
+        "test",
+        true,
+    )
+    .with_table_properties([
+        ("delta.feature.domainMetadata", "supported"),
+        ("delta.enableInCommitTimestamps", "true"),
+    ])
+    .with_domain_metadata("domain", "before")
+    .with_execution_mode::<Declarative>()
+    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .commit_declarative(&executor)?
+    .unwrap_post_commit_snapshot();
+    let info = executor.execute_and_retain(
+        "connector_info",
+        PlanBuilder::values(
+            schema_ref! { nullable "readVersion": LONG, nullable "isolationLevel": STRING },
+            vec![vec![0i64.into(), "Serializable".into()]],
+        )?
+        .build()?,
+    )?;
+    let txn = snapshot
+        .clone()
+        .update_table(UpdateTableOperation::Write, "test", true)
+        .with_execution_mode::<Declarative>()
+        .build(&engine, Box::new(FileSystemCommitter::new()))?
+        .with_domain_metadata_removed("domain".into())
+        .with_domain_metadata("new-domain".into(), "after".into())
+        .with_transaction_id("app".into(), 42)
+        .with_commit_info_ref(info);
+    let after = txn
+        .commit_declarative(&executor)?
+        .unwrap_post_commit_snapshot();
+    assert_eq!(after.reader().get_domain_metadata("domain", &engine)?, None);
+    assert_eq!(
+        after.reader().get_domain_metadata("new-domain", &engine)?,
+        Some("after".into())
+    );
+    assert_eq!(after.reader().get_app_id_version("app", &engine)?, Some(42));
+    let info = ::test_utils::read_actions_from_commit(after.table_root(), 1, "commitInfo").unwrap();
+    assert_eq!(info[0]["readVersion"], 0);
+    assert_eq!(info[0]["isolationLevel"], "Serializable");
+    assert_eq!(info[0]["operation"], "WRITE");
+    assert!(
+        after.reader().get_in_commit_timestamp(&engine)?
+            > snapshot.reader().get_in_commit_timestamp(&engine)?
+    );
+    let removed =
+        ::test_utils::read_actions_from_commit(after.table_root(), 1, "domainMetadata").unwrap();
+    assert!(removed.iter().any(|dm| dm["domain"] == "domain"
+        && dm["configuration"] == "before"
+        && dm["removed"] == true));
+    Ok(())
+}
+
+fn prepared_add(
+    executor: &impl ScopedPlanExecutor,
+    stats: &str,
+    partitions: Vec<(String, Option<String>)>,
+) -> KernelResult<RelationRef> {
+    let schema = schema_ref! {
+        nullable "path": STRING,
+        nullable "partitionValues": { STRING => nullable STRING },
+        nullable "size": LONG,
+        nullable "modificationTime": LONG,
+        nullable "dataChange": BOOLEAN,
+        nullable "stats": STRING,
+    };
+    let partitions = MapData::try_new(
+        MapType::new(DataType::STRING, DataType::STRING, true),
+        partitions,
+    )?;
+    executor.execute_and_retain(
+        "raw_add",
+        PlanBuilder::values(
+            schema,
+            vec![vec![
+                "file.parquet".into(),
+                partitions.into(),
+                100i64.into(),
+                10i64.into(),
+                true.into(),
+                stats.into(),
+            ]],
+        )?
+        .build()?,
+    )
+}
+
+#[rstest]
+#[case::invalid_json("broken", vec![])]
+#[case::invalid_count(r#"{"numRecords":"broken"}"#, vec![])]
+#[case::unknown_partition(r#"{"numRecords":1}"#, vec![("unknown".into(), None)])]
+fn malformed_prepared_actions_do_not_commit(
+    #[case] stats: &str,
+    #[case] partitions: Vec<(String, Option<String>)>,
+) -> Result<()> {
+    let dir = tempfile::tempdir().map_err(KernelError::from)?;
+    let engine = SyncEngine::new();
+    let executor = SyncPlanExecutor::default().get_scoped();
+    let mut txn = create_table(
         dir.path().to_string_lossy(),
         schema_ref! { nullable "id": LONG },
         "test",
@@ -247,22 +514,57 @@ fn create_and_append_round_trip() -> Result<()> {
     )
     .with_execution_mode::<Declarative>()
     .build(&engine, Box::new(FileSystemCommitter::new()))?;
-    create.add_files_ref(staged_add(&executor, "first.parquet", 3)?);
-    let snapshot = create
-        .commit_declarative(&executor)?
-        .unwrap_post_commit_snapshot();
-    assert_eq!(snapshot.version(), 0);
-    assert_eq!(snapshot.get_file_stats_if_present().unwrap().num_files(), 1);
-    let mut append = snapshot
-        .clone()
-        .update_table(UpdateTableOperation::Write, "test", true)
-        .with_execution_mode::<Declarative>()
-        .build(&engine, Box::new(FileSystemCommitter::new()))?;
-    append.add_files_ref(staged_add(&executor, "second.parquet", 4)?);
-    let after = append
-        .commit_declarative(&executor)?
-        .unwrap_post_commit_snapshot();
-    assert_eq!(after.version(), 1);
-    assert_eq!(after.get_file_stats_if_present().unwrap().num_files(), 2);
+    txn.add_actions_ref(prepared_add(&executor, stats, partitions)?);
+    assert!(txn.commit_declarative(&executor).is_err());
+    assert!(
+        !dir.path()
+            .join("_delta_log/00000000000000000000.json")
+            .exists()
+    );
+    Ok(())
+}
+
+#[rstest]
+fn partition_validation_uses_physical_names_and_allows_null_values(
+    #[values("none", "name")] mapping: &str,
+    #[values(false, true)] wrong_key: bool,
+) -> Result<()> {
+    let dir = tempfile::tempdir().map_err(KernelError::from)?;
+    let engine = SyncEngine::new();
+    let executor = SyncPlanExecutor::default().get_scoped();
+    let mut txn = create_table(
+        dir.path().to_string_lossy(),
+        schema_ref! { nullable "id": LONG, nullable "p": STRING },
+        "test",
+        true,
+    )
+    .with_data_layout(DataLayout::partitioned(["p"]))
+    .with_table_properties([("delta.columnMapping.mode", mapping)])
+    .with_execution_mode::<Declarative>()
+    .build(&engine, Box::new(FileSystemCommitter::new()))?;
+    let name = if wrong_key {
+        "wrong".into()
+    } else {
+        txn.effective_table_config
+            .physical_partition_columns()
+            .next()
+            .unwrap()
+    };
+    txn.add_actions_ref(prepared_add(
+        &executor,
+        r#"{"numRecords":1}"#,
+        vec![(name, None)],
+    )?);
+    let result = txn.commit_declarative(&executor);
+    if wrong_key {
+        assert!(result.is_err());
+        assert!(
+            !dir.path()
+                .join("_delta_log/00000000000000000000.json")
+                .exists()
+        );
+    } else {
+        assert_eq!(result?.unwrap_committed().commit_version(), 0);
+    }
     Ok(())
 }

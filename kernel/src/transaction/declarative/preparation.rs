@@ -1,6 +1,7 @@
 //! Declarative action preparation and commit orchestration.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 use super::actions::{normalize, reject, retain, scalar, values, wrap};
@@ -14,14 +15,15 @@ use crate::actions::{
 };
 use crate::committer::CommitResponse;
 use crate::crc::FileStatsDelta;
-use crate::expressions::{Expression, Predicate, col, column_name, lit};
+use crate::expressions::{Expression, Predicate, col, column_name, lit, null_lit};
 use crate::plans::ir::nodes::Agg;
 use crate::plans::{Operation, PlanBuilder, RelationRef, ScopedPlanExecutor};
 use crate::row_tracking::{
     ROW_TRACKING_DOMAIN_NAME, RowTrackingDomainMetadata, parse_row_tracking_high_water_mark,
 };
-use crate::schema::{DataType, SchemaRef, StructField, ToSchema, schema_ref};
+use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema, schema_ref};
 use crate::table_features::TableFeature;
+use crate::transaction::commit_info::{CommitInfoTagsVisitor, commit_info_literal_exprs};
 use crate::transaction::{CommitResult, NonfileCommitActions};
 use crate::{KernelError, KernelResult, Result, RowVisitor};
 
@@ -323,15 +325,69 @@ impl<S> Transaction<S, Declarative> {
 
     fn commit_info_plan(
         &self,
-        _executor: &dyn ScopedPlanExecutor,
-        info: CommitInfo,
+        executor: &dyn ScopedPlanExecutor,
+        mut info: CommitInfo,
     ) -> KernelResult<PlanBuilder> {
-        if self.staged_data_changes.commit_info.is_some() {
-            return Err(KernelError::unsupported(
-                "Declarative connector commit info",
+        let Some(reference) = self.staged_data_changes.commit_info.as_ref() else {
+            return PlanBuilder::values(LOG_COMMIT_INFO_SCHEMA.clone(), vec![vec![info.into()]]);
+        };
+        if scalar(executor, source(reference), Agg::count_star())? != Some(1) {
+            return Err(KernelError::invalid_transaction_state(
+                "Connector commit info must contain exactly one row",
             ));
         }
-        PlanBuilder::values(LOG_COMMIT_INFO_SCHEMA.clone(), vec![vec![info.into()]])
+        if reference.schema().contains("tags") {
+            let mut visitor = CommitInfoTagsVisitor::default();
+            let tags = source(reference)
+                .project(
+                    Expression::struct_from([col!("tags")]),
+                    reference.schema().project(&["tags"])?,
+                )?
+                .build()?;
+            for batch in executor
+                .execute_op(Operation::QueryPlan(tags))?
+                .into_data()?
+            {
+                visitor.visit_rows_of(batch?.as_ref())?;
+            }
+            info.merge_tags(visitor.tags);
+        }
+        let literals = commit_info_literal_exprs(info)?;
+        let kernel_schema = CommitInfo::to_schema();
+        let mut expressions = Vec::new();
+        let mut fields = Vec::new();
+        for field in reference.schema().fields() {
+            if let Some((_, value)) = literals.iter().find(|(name, _)| *name == field.name()) {
+                fields.push(
+                    kernel_schema
+                        .field(field.name())
+                        .ok_or_else(|| KernelError::internal_error("Missing commit info field"))?
+                        .clone(),
+                );
+                expressions.push(value.clone());
+            } else {
+                fields.push(field.clone());
+                expressions.push(Arc::new(Expression::column([field.name().clone()])));
+            }
+        }
+        for (name, expression) in literals {
+            if !reference.schema().contains(name) {
+                fields.push(
+                    kernel_schema
+                        .field(name)
+                        .ok_or_else(|| KernelError::internal_error("Missing commit info field"))?
+                        .clone(),
+                );
+                expressions.push(expression);
+            }
+        }
+        wrap(
+            source(reference).project(
+                Expression::struct_from(expressions),
+                Arc::new(StructType::try_new(fields)?),
+            )?,
+            "commitInfo",
+        )
     }
 
     fn prepare_file_relations(
@@ -339,16 +395,13 @@ impl<S> Transaction<S, Declarative> {
         executor: &dyn ScopedPlanExecutor,
         _domains: &HashMap<String, DomainMetadata>,
     ) -> KernelResult<(RelationRef, RelationRef, Option<i64>)> {
-        if !self.staged_data_changes.add_actions.is_empty()
-            || !self.staged_data_changes.remove_actions.is_empty()
-            || !self.staged_data_changes.remove_files.is_empty()
-            || !self.staged_data_changes.dv_updates.is_empty()
+        if !self.staged_data_changes.dv_updates.is_empty()
             || self
                 .effective_table_config
                 .should_assign_fresh_row_tracking_metadata()
         {
             return Err(KernelError::unsupported(
-                "Declarative prepared actions, removals, and row tracking",
+                "Declarative row tracking and DV updates",
             ));
         }
         let mut adds = Vec::new();
@@ -370,6 +423,16 @@ impl<S> Transaction<S, Declarative> {
             })?;
             adds.push(normalize(plan, Self::add_actions_schema())?);
         }
+        for reference in &self.staged_data_changes.add_actions {
+            adds.push(normalize(source(reference), Self::add_actions_schema())?);
+        }
+        let mut removes = Vec::new();
+        for reference in &self.staged_data_changes.remove_files {
+            removes.push(self.scan_action(source(reference), false)?);
+        }
+        for reference in &self.staged_data_changes.remove_actions {
+            removes.push(normalize(source(reference), Self::remove_actions_schema())?);
+        }
         Ok((
             retain(
                 executor,
@@ -379,10 +442,49 @@ impl<S> Transaction<S, Declarative> {
             retain(
                 executor,
                 "prepared_removes",
-                PlanBuilder::values(Self::remove_actions_schema(), vec![])?,
+                union_or_empty(removes, Self::remove_actions_schema())?,
             )?,
             None,
         ))
+    }
+
+    fn scan_action(&self, input: PlanBuilder, add: bool) -> KernelResult<PlanBuilder> {
+        let schema = if add {
+            Self::add_actions_schema()
+        } else {
+            Self::remove_actions_schema()
+        };
+        let stats = if input.schema().contains("stats_parsed") {
+            Expression::coalesce([
+                col!("stats"),
+                Expression::unary(
+                    crate::expressions::UnaryExpressionOp::ToJson,
+                    col!("stats_parsed"),
+                ),
+            ])
+        } else {
+            col!("stats")
+        };
+        let expressions = schema
+            .fields()
+            .map(|field| match field.name().as_str() {
+                "dataChange" => lit(self.data_change),
+                "deletionTimestamp" => lit(self.commit_timestamp),
+                "extendedFileMetadata" => Expression::from_pred(Predicate::and(
+                    col!("size").is_not_null(),
+                    col!("fileConstantValues.partitionValues").is_not_null(),
+                )),
+                "stats" => stats.clone(),
+                "partitionValues"
+                | "tags"
+                | "baseRowId"
+                | "defaultRowCommitVersion"
+                | "clusteringProvider" => Expression::column(["fileConstantValues", field.name()]),
+                name if input.schema().contains(name) => Expression::column([name]),
+                _ => null_lit(field.data_type().clone()),
+            })
+            .collect::<Vec<_>>();
+        input.project(Expression::struct_from(expressions), schema)
     }
 
     fn validate_relations(
