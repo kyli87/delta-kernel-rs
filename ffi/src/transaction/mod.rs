@@ -3346,6 +3346,7 @@ mod tests {
     #[case(KernelUpdateTableOperation::Merge, "MERGE")]
     #[case(KernelUpdateTableOperation::Optimize, "OPTIMIZE")]
     #[case(KernelUpdateTableOperation::Reorg, "REORG")]
+    #[case(KernelUpdateTableOperation::Truncate, "TRUNCATE")]
     #[tokio::test]
     async fn update_table_operation_variants_commit_expected_history_name(
         #[case] operation: KernelUpdateTableOperation,

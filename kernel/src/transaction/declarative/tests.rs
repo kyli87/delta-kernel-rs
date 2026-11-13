@@ -7,6 +7,7 @@ use crate::engine::arrow_data::EngineDataArrowExt;
 use crate::engine::sync::SyncEngine;
 use crate::engine::sync::plan::SyncPlanExecutor;
 use crate::expressions::{MapData, StructData};
+use crate::log_replay::HasSelectionVector;
 use crate::plans::PlanBuilder;
 use crate::scan::scan_row_schema;
 use crate::schema::{DataType, MapType, ToSchema, schema_ref};
@@ -295,6 +296,74 @@ fn create_append_remove_round_trip(#[values(false, true)] row_tracking: bool) ->
                 .get_row_tracking_high_water_mark(&engine)?,
             Some(11)
         );
+    }
+    Ok(())
+}
+
+#[rstest]
+fn truncate_removes_files_and_preserves_incremental_stats(
+    #[values(0, 2)] file_count: usize,
+    #[values(false, true)] declarative: bool,
+) -> Result<()> {
+    let dir = tempfile::tempdir().map_err(KernelError::from)?;
+    let engine = SyncEngine::new();
+    let executor = SyncPlanExecutor::default().get_scoped();
+    let mut create = create_table(
+        dir.path().to_string_lossy(),
+        schema_ref! { nullable "id": LONG },
+        "test",
+        true,
+    )
+    .with_execution_mode::<Declarative>()
+    .build(&engine, Box::new(FileSystemCommitter::new()))?;
+    for index in 0..file_count {
+        create.add_files_ref(staged_add(&executor, &format!("file-{index}.parquet"), 3)?);
+    }
+    let snapshot = create
+        .commit_declarative(&executor)?
+        .unwrap_post_commit_snapshot();
+    assert_eq!(
+        snapshot.get_file_stats_if_present().unwrap().num_files(),
+        file_count as i64
+    );
+    let scan = snapshot.clone().scan_builder().build()?;
+    let builder = snapshot
+        .clone()
+        .update_table(UpdateTableOperation::Truncate, "test", true);
+    let committed = if declarative {
+        let mut txn = builder
+            .with_execution_mode::<Declarative>()
+            .build(&engine, Box::new(FileSystemCommitter::new()))?;
+        for metadata in scan.scan_metadata(&engine)? {
+            let files = metadata?.scan_files;
+            if files.has_selected_rows() {
+                let batch = files.apply_selection_vector()?.try_into_record_batch()?;
+                txn.remove_files_ref(executor.create_ref("truncate", scan_row_schema(), batch)?);
+            }
+        }
+        txn.commit_declarative(&executor)?
+            .unwrap_post_commit_snapshot()
+    } else {
+        let mut txn = builder.build(&engine, Box::new(FileSystemCommitter::new()))?;
+        for metadata in scan.scan_metadata(&engine)? {
+            let files = metadata?.scan_files;
+            if files.has_selected_rows() {
+                txn.remove_files(files);
+            }
+        }
+        txn.commit(&engine)?.unwrap_post_commit_snapshot()
+    };
+    assert_eq!(committed.version(), 1);
+    assert_eq!(committed.schema(), snapshot.schema());
+    let stats = committed.get_file_stats_if_present().unwrap();
+    assert_eq!(stats.num_files(), 0);
+    assert_eq!(stats.table_size_bytes(), 0);
+    let info =
+        ::test_utils::read_actions_from_commit(committed.table_root(), 1, "commitInfo").unwrap();
+    assert_eq!(info[0]["operation"], "TRUNCATE");
+    let reloaded = crate::Snapshot::builder_for(committed.table_root().clone()).build(&engine)?;
+    for metadata in reloaded.scan_builder().build()?.scan_metadata(&engine)? {
+        assert!(!metadata?.scan_files.has_selected_rows());
     }
     Ok(())
 }

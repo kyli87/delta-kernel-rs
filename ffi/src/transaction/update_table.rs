@@ -465,6 +465,7 @@ pub enum KernelUpdateTableOperation {
     Merge = 5,
     Optimize = 6,
     Reorg = 7,
+    Truncate = 8,
 }
 
 impl From<KernelUpdateTableOperation> for UpdateTableOperation {
@@ -478,6 +479,7 @@ impl From<KernelUpdateTableOperation> for UpdateTableOperation {
             KernelUpdateTableOperation::Merge => Self::Merge,
             KernelUpdateTableOperation::Optimize => Self::Optimize,
             KernelUpdateTableOperation::Reorg => Self::Reorg,
+            KernelUpdateTableOperation::Truncate => Self::Truncate,
         }
     }
 }

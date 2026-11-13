@@ -36,6 +36,8 @@ pub enum UpdateTableOperation {
     Optimize,
     /// A data-file reorganization that preserves logical table data.
     Reorg,
+    /// A table truncation that removes all data files while preserving table metadata.
+    Truncate,
     /// An operation name recorded verbatim in commit history and successful transaction metrics.
     ///
     /// The name must be nonempty and must not match a reserved operation name, such as `REORG` or
@@ -68,6 +70,7 @@ impl UpdateTableOperation {
             Self::Merge => "MERGE",
             Self::Optimize => "OPTIMIZE",
             Self::Reorg => "REORG",
+            Self::Truncate => "TRUNCATE",
             Self::Custom(operation) => operation,
         }
     }
@@ -176,6 +179,7 @@ mod tests {
             ("MERGE", UpdateTableOperation::Merge, true),
             ("OPTIMIZE", UpdateTableOperation::Optimize, true),
             ("REORG", UpdateTableOperation::Reorg, true),
+            ("TRUNCATE", UpdateTableOperation::Truncate, true),
         ];
         for (name, operation, incremental_safe) in cases {
             assert_eq!(operation.as_str(), name);
@@ -218,7 +222,6 @@ mod tests {
                     "LIQUID TAGGING",
                     "REPLACE PARTITIONED BY WITH CLUSTER BY",
                     "Deletion Vector Tombstones",
-                    "TRUNCATE",
                 ]
                 .map(str::to_owned),
             )
