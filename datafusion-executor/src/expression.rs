@@ -2,8 +2,8 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::{ArrayRef, RecordBatch, StructArray, new_null_array};
-use datafusion::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema};
+use datafusion::arrow::array::{ArrayRef, RecordBatch};
+use datafusion::arrow::datatypes::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
 use datafusion::common::utils::take_function_args;
 use datafusion::common::{
     Column as DFColumn, DataFusionError, Result as DFResult, ScalarValue as DFScalarValue,
@@ -15,9 +15,7 @@ use datafusion::logical_expr::{
     Signature, Volatility, binary_expr, cast, lit,
 };
 use delta_kernel::engine::arrow_conversion::TryIntoArrow;
-use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::arrow_expression::evaluate_expression as kernel_expression;
-use delta_kernel::engine::parse_json;
 use delta_kernel::expressions::{
     BinaryExpression, BinaryExpressionOp, Expression as KernelExpression, ExpressionRef,
     ExpressionStructPatch, MapToStructExpression, MapToStructOptions, ParseJsonExpression,
@@ -27,7 +25,7 @@ use delta_kernel::schema::{
     DataType as KernelDataType, PrimitiveType, SchemaRef as KernelSchemaRef, StructField,
     StructType,
 };
-use delta_kernel::{EngineData, KernelError, KernelResult};
+use delta_kernel::{KernelError, KernelResult};
 
 use crate::predicate::to_df_predicate_expr;
 use crate::scalar::to_df_scalar;
@@ -76,6 +74,14 @@ pub fn to_df_expr(
             UnaryExpressionOp::ToJson => Err(KernelError::unsupported(
                 "converting the ToJson expression is not yet supported",
             )),
+            UnaryExpressionOp::MapKeys | UnaryExpressionOp::Cardinality => {
+                let child = to_df_expr(&u.expr, input_schema, None)?;
+                Ok(ScalarUDF::new_from_impl(CollectionUdf {
+                    op: u.op,
+                    signature: Signature::any(1, Volatility::Immutable),
+                })
+                .call(vec![child]))
+            }
         },
 
         KernelExpression::CaseWhen(_) => Err(KernelError::unsupported(
@@ -547,22 +553,23 @@ fn parse_json_to_df_expr(
     input_schema: &StructType,
 ) -> KernelResult<DFExpr> {
     let json = to_df_expr(&parse.json_expr, input_schema, None)?;
-    let udf = ScalarUDF::new_from_impl(ParseJsonUdf::try_new(parse.output_schema.clone())?);
+    let mut udf = ParseJsonUdf::try_new(parse.output_schema.clone())?;
+    udf.fail_on_error = parse.fail_on_error;
+    let udf = ScalarUDF::new_from_impl(udf);
     Ok(udf.call(vec![json]))
 }
 
 /// A DataFusion scalar UDF that parses a JSON-string column into a struct, delegating to kernel's
-/// [`parse_json`] so the result is value-identical to the kernel evaluator by construction. Since a
+/// expression evaluator so the result is value-identical by construction. Since a
 /// [`ParseJsonExpression`] carries its own target schema, the schema is baked into the UDF instance
 /// rather than passed as an argument.
 ///
-/// The UDF reproduces the coarse malformed-JSON backstop the evaluator applies around
-/// `parse_json`: on a whole-batch parse error it returns an all-null struct rather than failing.
-/// (The finer per-cell null for failure-prone leaves -- Timestamp/Date/Decimal -- already lives
-/// inside `parse_json`.)
+/// The parser mode participates in UDF identity so strict validation cannot share results with
+/// permissive reads.
 #[derive(Debug, PartialEq, Eq)]
 struct ParseJsonUdf {
     output_schema: KernelSchemaRef,
+    fail_on_error: bool,
     return_type: ArrowDataType,
     signature: Signature,
 }
@@ -573,6 +580,7 @@ struct ParseJsonUdf {
 /// otherwise identical for every instance.
 impl std::hash::Hash for ParseJsonUdf {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.fail_on_error.hash(state);
         for field in self.output_schema.fields() {
             field.name().hash(state);
             field.data_type().to_string().hash(state);
@@ -591,6 +599,7 @@ impl ParseJsonUdf {
             // Coerces Utf8 / LargeUtf8 / Utf8View, mirroring kernel's `parse_json_impl`.
             signature: Signature::string(1, Volatility::Immutable),
             output_schema,
+            fail_on_error: false,
         })
     }
 }
@@ -611,30 +620,88 @@ impl ScalarUDFImpl for ParseJsonUdf {
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
         let num_rows = args.number_rows;
         let [json] = take_function_args(self.name(), args.args)?;
-        let json = json.into_array(num_rows)?;
-
-        // `parse_json` reads column 0 of an `EngineData`-wrapped batch; wrap the input to match.
-        let batch = RecordBatch::try_from_iter([("json", json)])?;
-        let input: Box<dyn EngineData> = Box::new(ArrowEngineData::from(batch));
-
-        let parsed = match parse_json(input, self.output_schema.clone()) {
-            Ok(data) => {
-                let batch: RecordBatch = ArrowEngineData::try_from_engine_data(data)
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?
-                    .into();
-                Arc::new(StructArray::from(batch)) as ArrayRef
-            }
-            // Coarse malformed-JSON backstop, matching the evaluator's ParseJson arm.
-            Err(_) => new_null_array(&self.return_type, num_rows),
+        let batch = RecordBatch::try_from_iter([("json", json.into_array(num_rows)?)])?;
+        let expression = if self.fail_on_error {
+            KernelExpression::parse_json_strict(
+                KernelExpression::column(["json"]),
+                self.output_schema.clone(),
+            )
+        } else {
+            KernelExpression::parse_json(
+                KernelExpression::column(["json"]),
+                self.output_schema.clone(),
+            )
         };
+        let parsed = kernel_expression::evaluate_expression(&expression, &batch, None)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
         Ok(ColumnarValue::Array(parsed))
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct CollectionUdf {
+    op: UnaryExpressionOp,
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for CollectionUdf {
+    fn name(&self) -> &str {
+        if self.op == UnaryExpressionOp::MapKeys {
+            "kernel_map_keys"
+        } else {
+            "kernel_cardinality"
+        }
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, arg_types: &[ArrowDataType]) -> DFResult<ArrowDataType> {
+        match (self.op, arg_types) {
+            (UnaryExpressionOp::MapKeys, [ArrowDataType::Map(entries, _)]) => {
+                let ArrowDataType::Struct(fields) = entries.data_type() else {
+                    return Err(DataFusionError::Plan("MapKeys requires map entries".into()));
+                };
+                let key = fields
+                    .first()
+                    .ok_or_else(|| DataFusionError::Plan("MapKeys requires a key field".into()))?;
+                Ok(ArrowDataType::List(Arc::new(Field::new(
+                    "element",
+                    key.data_type().clone(),
+                    false,
+                ))))
+            }
+            (
+                UnaryExpressionOp::Cardinality,
+                [
+                    ArrowDataType::Map(..)
+                    | ArrowDataType::List(..)
+                    | ArrowDataType::LargeList(..)
+                    | ArrowDataType::FixedSizeList(..),
+                ],
+            ) => Ok(ArrowDataType::Int64),
+            _ => Err(DataFusionError::Plan(format!(
+                "{} does not accept {arg_types:?}",
+                self.name()
+            ))),
+        }
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let [input] = take_function_args(self.name(), args.args)?;
+        let batch = RecordBatch::try_from_iter([("value", input.into_array(args.number_rows)?)])?;
+        let expression = KernelExpression::unary(self.op, KernelExpression::column(["value"]));
+        let result = kernel_expression::evaluate_expression(&expression, &batch, None)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(ColumnarValue::Array(result))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use datafusion::arrow::array::{
-        Array, AsArray, Int32Array, MapBuilder, StringArray, StringBuilder,
+        Array, AsArray, Int32Array, MapBuilder, StringArray, StringBuilder, StructArray,
         TimestampMicrosecondArray,
     };
     use datafusion::arrow::datatypes::Field as ArrowField;
@@ -1321,9 +1388,6 @@ mod tests {
     /// carrying `rows`, evaluates it, and returns the resulting struct column.
     fn eval_parse_json(schema: KernelSchemaRef, rows: Vec<Option<&str>>) -> StructArray {
         let kernel = KernelExpr::parse_json(col!("j"), schema);
-        // Self-typed: no output_type is threaded in, yet lowering still succeeds.
-        let logical = to_df_expr(&kernel, &json_input_schema(), None).unwrap();
-
         let arrow_schema: ArrowSchema = (&json_input_schema()).try_into_arrow().unwrap();
         let batch = RecordBatch::try_new(
             Arc::new(arrow_schema.clone()),
@@ -1331,21 +1395,27 @@ mod tests {
         )
         .unwrap();
 
-        let df_schema = DFSchema::try_from(arrow_schema).unwrap();
+        eval_with_datafusion(&kernel, &json_input_schema(), &batch)
+            .unwrap()
+            .as_struct()
+            .clone()
+    }
+
+    fn eval_with_datafusion(
+        expression: &KernelExpr,
+        input_schema: &StructType,
+        batch: &RecordBatch,
+    ) -> DFResult<ArrayRef> {
+        let logical = to_df_expr(expression, input_schema, None)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let df_schema = DFSchema::try_from(batch.schema().as_ref().clone())?;
         let physical = create_physical_expr(
             &logical,
             &df_schema,
             &ExecutionProps::new(),
             &PhysicalPlanningContext::default(),
-        )
-        .unwrap();
-        physical
-            .evaluate(&batch)
-            .unwrap()
-            .into_array(batch.num_rows())
-            .unwrap()
-            .as_struct()
-            .clone()
+        )?;
+        physical.evaluate(batch)?.into_array(batch.num_rows())
     }
 
     /// [`eval_parse_json`] with the struct flattened to one column per parsed field. Panics on a
@@ -1362,6 +1432,62 @@ mod tests {
     }
 
     // === ParseJson Tests ===
+
+    #[rstest]
+    #[case::malformed("{bad", true)]
+    #[case::wrong_type(r#"{"n":"bad"}"#, true)]
+    #[case::valid(r#"{"n":2,"ignored":true}"#, false)]
+    #[case::missing("{}", false)]
+    fn strict_json_mode_is_preserved_in_datafusion(
+        #[case] json: &str,
+        #[case] invalid: bool,
+        #[values(false, true)] strict: bool,
+    ) {
+        let expression = if strict {
+            KernelExpr::parse_json_strict(col!("j"), parse_target())
+        } else {
+            KernelExpr::parse_json(col!("j"), parse_target())
+        };
+        let batch = RecordBatch::try_from_iter([(
+            "j",
+            Arc::new(StringArray::from(vec![Some(json), None])) as ArrayRef,
+        )])
+        .unwrap();
+        let result = eval_with_datafusion(&expression, &json_input_schema(), &batch);
+        assert_eq!(result.is_err(), strict && invalid);
+    }
+
+    #[rstest]
+    fn collection_functions_execute_in_datafusion(
+        #[values(UnaryExpressionOp::MapKeys, UnaryExpressionOp::Cardinality)] op: UnaryExpressionOp,
+    ) {
+        let mut maps = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        maps.keys().append_value("p");
+        maps.values().append_null();
+        maps.append(true).unwrap();
+        maps.append(true).unwrap();
+        maps.append(false).unwrap();
+        let batch =
+            RecordBatch::try_from_iter([("pv", Arc::new(maps.finish()) as ArrayRef)]).unwrap();
+        let expression = KernelExpr::unary(op, col!("pv"));
+        let result = eval_with_datafusion(&expression, &pv_map_schema(), &batch).unwrap();
+        assert!(result.is_null(2));
+        if op == UnaryExpressionOp::Cardinality {
+            assert_eq!(
+                result
+                    .as_primitive::<datafusion::arrow::datatypes::Int64Type>()
+                    .values(),
+                &[1, 0, 0]
+            );
+        } else {
+            let keys = result.as_list::<i32>();
+            assert_eq!(
+                keys.value(0).as_string::<i32>(),
+                &StringArray::from(vec!["p"])
+            );
+            assert_eq!(keys.value_length(1), 0);
+        }
+    }
 
     #[test]
     fn parse_json_lowers_to_udf_call() {

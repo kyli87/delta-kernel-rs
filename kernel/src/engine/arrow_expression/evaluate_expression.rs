@@ -11,7 +11,7 @@ use super::timestamp_timezone::TimestampTimezone;
 use crate::arrow::array::types::*;
 use crate::arrow::array::{
     self as arrow_array, Array, ArrayBuilder, ArrayData, ArrayRef, AsArray, BooleanArray, Datum,
-    ListArray, MapArray, MutableArrayData, NullBufferBuilder, RecordBatch, StringArray,
+    Int64Array, ListArray, MapArray, MutableArrayData, NullBufferBuilder, RecordBatch, StringArray,
     StructArray, make_array, new_null_array,
 };
 use crate::arrow::buffer::{NullBuffer, OffsetBuffer};
@@ -35,7 +35,7 @@ use crate::engine::arrow_conversion::{LIST_ARRAY_ROOT, TryFromKernel, TryIntoArr
 use crate::engine::arrow_expression::opaque::{
     ArrowOpaqueExpressionOpAdaptor, ArrowOpaquePredicateOpAdaptor,
 };
-use crate::engine::arrow_utils::{list_type_with_element, parse_json_impl, prim_array_cmp};
+use crate::engine::arrow_utils::{list_type_with_element, parse_json_with_mode, prim_array_cmp};
 use crate::engine::ensure_data_types::{ValidationMode, ensure_data_types};
 use crate::error::{KernelError, KernelResult};
 use crate::expressions::{
@@ -325,6 +325,68 @@ pub fn evaluate_expression(
                 "ToJson operator requires STRING output, but got {data_type:?}"
             ))),
         },
+        (Unary(UnaryExpression { op: MapKeys, expr }), result_type) => {
+            let input = evaluate_expression(expr, batch, None)?;
+            let map = input
+                .as_map_opt()
+                .ok_or_else(|| KernelError::generic("MapKeys requires a map input"))?;
+            let keys = ListArray::try_new(
+                Arc::new(ArrowField::new(
+                    LIST_ARRAY_ROOT,
+                    map.keys().data_type().clone(),
+                    false,
+                )),
+                map.offsets().clone(),
+                map.keys().clone(),
+                map.nulls().cloned(),
+            )?;
+            validate_array_type(Arc::new(keys), result_type)
+        }
+        (
+            Unary(UnaryExpression {
+                op: Cardinality,
+                expr,
+            }),
+            result_type,
+        ) => {
+            let input = evaluate_expression(expr, batch, None)?;
+            if !matches!(
+                input.data_type(),
+                ArrowDataType::Map(..)
+                    | ArrowDataType::List(..)
+                    | ArrowDataType::LargeList(..)
+                    | ArrowDataType::FixedSizeList(..)
+            ) {
+                return Err(KernelError::generic(format!(
+                    "Cardinality requires an array or map input, got {}",
+                    input.data_type()
+                )));
+            }
+            let lengths = (0..input.len())
+                .map(|row| {
+                    if input.is_null(row) {
+                        return Ok(None);
+                    }
+                    let length = match input.data_type() {
+                        ArrowDataType::Map(..) => i64::from(input.as_map().value_length(row)),
+                        ArrowDataType::List(..) => {
+                            i64::from(input.as_list::<i32>().value_length(row))
+                        }
+                        ArrowDataType::LargeList(..) => input.as_list::<i64>().value_length(row),
+                        ArrowDataType::FixedSizeList(..) => {
+                            i64::from(input.as_fixed_size_list().value_length())
+                        }
+                        other => {
+                            return Err(KernelError::generic(format!(
+                                "Cardinality requires an array or map input, got {other}"
+                            )));
+                        }
+                    };
+                    Ok(Some(length))
+                })
+                .collect::<KernelResult<Vec<_>>>()?;
+            validate_array_type(Arc::new(Int64Array::from(lengths)), result_type)
+        }
         (Binary(BinaryExpression { op, left, right }), _) => {
             let left_arr = evaluate_expression(left.as_ref(), batch, None)?;
             let right_arr = evaluate_expression(right.as_ref(), batch, None)?;
@@ -378,12 +440,10 @@ pub fn evaluate_expression(
         }
         (ParseJson(p), _) => {
             let json_arr = evaluate_expression(&p.json_expr, batch, Some(&DataType::STRING))?;
-            // Coarser backstop for genuinely malformed JSON (incomplete records, unmatched
-            // braces, etc.). Cell-level type-parse failures in failure-prone leaves
-            // (Timestamp/Date/Decimal) are handled inside `parse_json_impl` itself, which
-            // converts them to per-cell NULL rather than failing the batch.
-            match parse_json_impl(json_arr.as_ref(), p.output_schema.clone()) {
+            match parse_json_with_mode(json_arr.as_ref(), p.output_schema.clone(), p.fail_on_error)
+            {
                 Ok(batch) => Ok(Arc::new(StructArray::from(batch)) as ArrayRef),
+                Err(e) if p.fail_on_error => Err(e),
                 Err(e) => {
                     warn!(
                         "Failed to parse JSON stats as {}: {e}. Using null stats.",
@@ -2580,6 +2640,98 @@ mod tests {
         let result = evaluate_expression(&expr, &batch, None).expect("parses permissively");
         assert_eq!(result.len(), input.len());
         assert_eq!(result.null_count(), expected_null_count);
+    }
+
+    #[rstest]
+    #[case::malformed(DataType::LONG, "{bad")]
+    #[case::wrong_type(DataType::LONG, r#"{"value":"bad"}"#)]
+    #[case::bad_date(DataType::DATE, r#"{"value":"bad"}"#)]
+    #[case::bad_timestamp(DataType::TIMESTAMP, r#"{"value":"bad"}"#)]
+    #[case::bad_decimal(DataType::decimal(5, 2).unwrap(), r#"{"value":"bad"}"#)]
+    fn strict_parse_json_rejects_invalid_values(
+        #[case] data_type: DataType,
+        #[case] json: &str,
+        #[values(false, true)] strict: bool,
+    ) {
+        let batch = RecordBatch::try_from_iter([(
+            "json",
+            Arc::new(StringArray::from(vec![json])) as ArrayRef,
+        )])
+        .unwrap();
+        let schema = schema_ref! { nullable "value": (data_type) };
+        let expr = if strict {
+            Expr::parse_json_strict(col!("json"), schema)
+        } else {
+            Expr::parse_json(col!("json"), schema)
+        };
+        assert_eq!(evaluate_expression(&expr, &batch, None).is_err(), strict);
+    }
+
+    #[test]
+    fn strict_parse_json_accepts_missing_null_and_unknown_fields() {
+        let batch = RecordBatch::try_from_iter([(
+            "json",
+            Arc::new(StringArray::from(vec![
+                Some(r#"{"value":7,"unknown":true}"#),
+                Some("{}"),
+                Some(r#"{"value":null}"#),
+                None,
+            ])) as ArrayRef,
+        )])
+        .unwrap();
+        let expr = Expr::parse_json_strict(col!("json"), schema_ref! { nullable "value": LONG });
+        let result = evaluate_expression(&expr, &batch, None).unwrap();
+        assert_eq!(
+            result.as_struct().column(0).as_ref(),
+            &Int64Array::from(vec![Some(7), None, None, None]) as &dyn Array
+        );
+    }
+
+    #[test]
+    fn collection_expressions_preserve_nulls_and_sliced_offsets() {
+        let mut maps = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        maps.keys().append_value("discard");
+        maps.values().append_value("discard");
+        maps.append(true).unwrap();
+        maps.keys().append_value("a");
+        maps.values().append_null();
+        maps.keys().append_value("b");
+        maps.values().append_value("2");
+        maps.append(true).unwrap();
+        maps.append(true).unwrap();
+        maps.append(false).unwrap();
+        let batch =
+            RecordBatch::try_from_iter([("map", Arc::new(maps.finish().slice(1, 3)) as ArrayRef)])
+                .unwrap();
+        let keys_expr = Expr::unary(UnaryExpressionOp::MapKeys, col!("map"));
+        let keys = evaluate_expression(&keys_expr, &batch, None).unwrap();
+        let keys = keys.as_list::<i32>();
+        assert_eq!(
+            keys.value(0).as_string::<i32>(),
+            &StringArray::from(vec!["a", "b"])
+        );
+        assert_eq!(keys.value_length(1), 0);
+        assert!(keys.is_null(2));
+        for child in [col!("map"), keys_expr] {
+            let size = Expr::unary(UnaryExpressionOp::Cardinality, child);
+            let result = evaluate_expression(&size, &batch, Some(&DataType::LONG)).unwrap();
+            assert_eq!(
+                result.as_primitive::<Int64Type>(),
+                &Int64Array::from(vec![Some(2), Some(0), None])
+            );
+        }
+    }
+
+    #[rstest]
+    fn collection_expressions_reject_non_collection_inputs(
+        #[values(UnaryExpressionOp::MapKeys, UnaryExpressionOp::Cardinality)] op: UnaryExpressionOp,
+    ) {
+        let batch = RecordBatch::try_from_iter([(
+            "value",
+            Arc::new(Int64Array::from(vec![None])) as ArrayRef,
+        )])
+        .unwrap();
+        assert!(evaluate_expression(&Expr::unary(op, col!("value")), &batch, None).is_err());
     }
 
     #[test]

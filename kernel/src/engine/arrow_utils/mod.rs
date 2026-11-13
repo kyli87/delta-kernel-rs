@@ -1338,17 +1338,34 @@ pub(crate) fn parse_json_impl(
     json_strings: &dyn ArrowArray,
     schema: SchemaRef,
 ) -> KernelResult<RecordBatch> {
+    parse_json_with_mode(json_strings, schema, false)
+}
+
+pub(crate) fn parse_json_with_mode(
+    json_strings: &dyn ArrowArray,
+    schema: SchemaRef,
+    fail_on_error: bool,
+) -> KernelResult<RecordBatch> {
     let num_rows = json_strings.len();
     match json_strings.data_type() {
-        ArrowDataType::Utf8 => {
-            parse_json_inner(json_strings.as_string::<i32>().iter(), num_rows, schema)
-        }
-        ArrowDataType::LargeUtf8 => {
-            parse_json_inner(json_strings.as_string::<i64>().iter(), num_rows, schema)
-        }
-        ArrowDataType::Utf8View => {
-            parse_json_inner(json_strings.as_string_view().iter(), num_rows, schema)
-        }
+        ArrowDataType::Utf8 => parse_json_inner(
+            json_strings.as_string::<i32>().iter(),
+            num_rows,
+            schema,
+            fail_on_error,
+        ),
+        ArrowDataType::LargeUtf8 => parse_json_inner(
+            json_strings.as_string::<i64>().iter(),
+            num_rows,
+            schema,
+            fail_on_error,
+        ),
+        ArrowDataType::Utf8View => parse_json_inner(
+            json_strings.as_string_view().iter(),
+            num_rows,
+            schema,
+            fail_on_error,
+        ),
         dt => Err(KernelError::generic(format!(
             "Expected string array for JSON parsing, got {dt}"
         ))),
@@ -1359,7 +1376,12 @@ fn parse_json_inner<'a>(
     json_strings: impl Iterator<Item = Option<&'a str>>,
     num_rows: usize,
     schema: SchemaRef,
+    fail_on_error: bool,
 ) -> KernelResult<RecordBatch> {
+    if fail_on_error {
+        let arrow_target = Arc::new(ArrowSchema::try_from_kernel(schema.as_ref())?);
+        return decode_with_arrow_json(json_strings, num_rows, arrow_target);
+    }
     // arrow-json's typed Timestamp/TimestampNtz/Date/Decimal decoders fail the entire batch
     // on a single bad cell, so rewrite those leaves to `String` first and safe-cast back to
     // the target type. `Cow::Borrowed` means nothing was rewritten; skip the cast pass.

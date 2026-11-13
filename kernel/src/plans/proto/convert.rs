@@ -451,6 +451,7 @@ impl From<&ParseJsonExpression> for proto_expr::ParseJsonExpression {
         proto_expr::ParseJsonExpression {
             json_expr: Some(Box::new(parse_json.json_expr.as_ref().into())),
             output_schema: Some(parse_json.output_schema.as_ref().into()),
+            fail_on_error: parse_json.fail_on_error,
         }
     }
 }
@@ -541,6 +542,8 @@ impl From<UnaryExpressionOp> for proto_expr::UnaryExpressionOp {
     fn from(op: UnaryExpressionOp) -> Self {
         match op {
             UnaryExpressionOp::ToJson => proto_expr::UnaryExpressionOp::ToJson,
+            UnaryExpressionOp::MapKeys => proto_expr::UnaryExpressionOp::MapKeys,
+            UnaryExpressionOp::Cardinality => proto_expr::UnaryExpressionOp::Cardinality,
         }
     }
 }
@@ -1879,15 +1882,19 @@ mod tests {
         assert_eq!(opaque.exprs.len(), 2);
     }
 
-    #[test]
-    fn from_parse_json_expression() {
-        let proto_expr::expression::Kind::ParseJson(parse_json) =
-            expr_kind_of(Expression::parse_json(lit("{}"), sample_schema()))
-        else {
+    #[rstest]
+    fn from_parse_json_expression(#[values(false, true)] strict: bool) {
+        let expression = if strict {
+            Expression::parse_json_strict(lit("{}"), sample_schema())
+        } else {
+            Expression::parse_json(lit("{}"), sample_schema())
+        };
+        let proto_expr::expression::Kind::ParseJson(parse_json) = expr_kind_of(expression) else {
             panic!("expected a parse_json expression");
         };
         assert!(parse_json.json_expr.is_some());
         assert!(parse_json.output_schema.is_some());
+        assert_eq!(parse_json.fail_on_error, strict);
     }
 
     #[test]
@@ -1993,6 +2000,11 @@ mod tests {
 
     #[rstest]
     #[case(UnaryExpressionOp::ToJson, proto_expr::UnaryExpressionOp::ToJson)]
+    #[case(UnaryExpressionOp::MapKeys, proto_expr::UnaryExpressionOp::MapKeys)]
+    #[case(
+        UnaryExpressionOp::Cardinality,
+        proto_expr::UnaryExpressionOp::Cardinality
+    )]
     fn from_unary_expression_op(
         #[case] op: UnaryExpressionOp,
         #[case] expected: proto_expr::UnaryExpressionOp,

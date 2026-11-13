@@ -147,6 +147,12 @@ pub enum UnaryExpressionOp {
     ///
     /// [Per-file Statistics]: https://github.com/delta-io/delta/blob/master/PROTOCOL.md#per-file-statistics
     ToJson,
+    /// Returns a map's keys as an array, preserving their input order. A NULL map yields NULL.
+    /// The output element type is the map's key type and elements are never NULL.
+    MapKeys,
+    /// Returns the number of elements in an array or entries in a map as LONG.
+    /// A NULL input yields NULL; an empty collection yields zero.
+    Cardinality,
 }
 
 /// A binary arithmetic operator over two numeric operands.
@@ -390,10 +396,10 @@ pub struct CaseWhenExpression {
 /// inverse of [`UnaryExpressionOp::ToJson`] except for the sub-millisecond timestamp precision
 /// that operator discards.
 ///
-/// Unparseable input must degrade to NULL rather than fail the query, because kernel parses
-/// `add.stats` with this operator and data skipping reads null stats as "include the file". The
-/// required part is that it does not error; whether a given row comes back as a null struct or as a
-/// struct of null fields is unspecified, since data skipping treats the two alike.
+/// By default, unparseable input degrades to NULL rather than failing the query, because kernel
+/// parses `add.stats` with this operator and data skipping reads null stats as "include the file".
+/// The required part is that it does not error; whether a given row comes back as a null struct or
+/// as a struct of null fields is unspecified, since data skipping treats the two alike.
 ///
 /// An empty string is not valid JSON here, so it is unparseable. This operator does not share
 /// [`MapToStructExpression`]'s empty-string-to-NULL behavior. It is SQL `from_json(json_expr,
@@ -408,12 +414,20 @@ pub struct CaseWhenExpression {
 /// JSON and a type mismatch on any other leaf, falls back to nulling the entire batch rather than
 /// the offending row. A NULL input decodes as `{}`, leaving every field NULL without disturbing the
 /// rest of the batch.
+///
+/// With `fail_on_error`, malformed JSON and values incompatible with the declared schema fail
+/// execution. Missing fields and NULL values remain valid, and unknown fields are ignored. Use
+/// this mode when validating new data, where treating invalid values as absent would hide errors.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ParseJsonExpression {
     /// The expression that evaluates to a STRING column containing JSON objects.
     pub json_expr: Box<Expression>,
     /// The schema defining the structure to parse the JSON into.
     pub output_schema: SchemaRef,
+    /// Whether malformed JSON and incompatible values must fail execution instead of yielding
+    /// NULL.
+    #[serde(default)]
+    pub fail_on_error: bool,
 }
 
 /// An expression that casts a child expression to a target type, following SQL `CAST` semantics: a
@@ -714,6 +728,7 @@ impl ParseJsonExpression {
         Self {
             json_expr: Box::new(json_expr.into()),
             output_schema,
+            fail_on_error: false,
         }
     }
 }
@@ -1042,6 +1057,15 @@ impl Expression {
         Self::ParseJson(ParseJsonExpression::new(json_expr, output_schema))
     }
 
+    /// Parses JSON objects into a struct, rejecting malformed JSON and incompatible field values.
+    /// Missing fields, NULL values, and fields absent from `output_schema` are accepted.
+    pub fn parse_json_strict(json_expr: impl Into<Expression>, output_schema: SchemaRef) -> Self {
+        Self::ParseJson(ParseJsonExpression {
+            fail_on_error: true,
+            ..ParseJsonExpression::new(json_expr, output_schema)
+        })
+    }
+
     /// Parses an Add action's `partitionValues` map into a typed struct whose schema comes from the
     /// evaluator's result type. A null map produces a null struct; missing and null values produce
     /// null fields; literal empty strings stay empty only for STRING and BINARY. Duplicate-key
@@ -1237,6 +1261,8 @@ impl Display for UnaryExpressionOp {
         use UnaryExpressionOp::*;
         match self {
             ToJson => write!(f, "TO_JSON"),
+            MapKeys => write!(f, "MAP_KEYS"),
+            Cardinality => write!(f, "CARDINALITY"),
         }
     }
 }
@@ -1344,7 +1370,12 @@ impl Display for Expression {
             ParseJson(p) => {
                 write!(
                     f,
-                    "PARSE_JSON({}, <schema:{} fields>)",
+                    "{}({}, <schema:{} fields>)",
+                    if p.fail_on_error {
+                        "PARSE_JSON_STRICT"
+                    } else {
+                        "PARSE_JSON"
+                    },
                     p.json_expr,
                     p.output_schema.fields().len()
                 )

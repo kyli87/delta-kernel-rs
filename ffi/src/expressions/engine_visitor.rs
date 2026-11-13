@@ -671,6 +671,16 @@ fn visit_expression_impl(
             visit_expression_impl(visitor, expr, child_list_id);
             let visit_fn = match op {
                 UnaryExpressionOp::ToJson => visitor.visit_to_json,
+                UnaryExpressionOp::MapKeys | UnaryExpressionOp::Cardinality => {
+                    let name = "map collection expression requires plan execution";
+                    call!(
+                        visitor,
+                        visit_unknown,
+                        sibling_list_id,
+                        kernel_string_slice!(name)
+                    );
+                    return;
+                }
             };
             visit_fn(visitor.data, sibling_list_id, child_list_id);
         }
@@ -724,7 +734,18 @@ fn visit_expression_impl(
         Expression::ParseJson(ParseJsonExpression {
             json_expr,
             output_schema,
+            fail_on_error,
         }) => {
+            if *fail_on_error {
+                let name = "strict JSON parsing requires plan execution";
+                call!(
+                    visitor,
+                    visit_unknown,
+                    sibling_list_id,
+                    kernel_string_slice!(name)
+                );
+                return;
+            }
             let child_list_id = call!(visitor, make_field_list, 1);
             visit_expression_impl(visitor, json_expr, child_list_id);
             let schema_handle = Handle::from(output_schema.clone());

@@ -350,7 +350,10 @@ pub trait ExpressionTransform<'a> {
         &mut self,
         expr: &'a ParseJsonExpression,
     ) -> Self::Output<ParseJsonExpression> {
-        let f = |json_expr| ParseJsonExpression::new(json_expr, expr.output_schema.clone());
+        let f = |json_expr| ParseJsonExpression {
+            fail_on_error: expr.fail_on_error,
+            ..ParseJsonExpression::new(json_expr, expr.output_schema.clone())
+        };
         map_owned_or_else(expr, self.transform_expr(&expr.json_expr), f)
     }
 
@@ -958,6 +961,20 @@ mod tests {
         if let Cow::Borrowed(result_expr) = result {
             assert_eq!(result_expr, &parse_json_expr);
         }
+    }
+
+    #[test]
+    fn strict_json_mode_survives_child_transform() {
+        let expr = Expr::parse_json_strict(col!("old_col"), test_output_schema());
+        let Expr::ParseJson(transformed) = ColumnReplacer(Some("new_col"))
+            .transform_expr(&expr)
+            .unwrap()
+            .into_owned()
+        else {
+            panic!("expected parse-json expression");
+        };
+        assert_eq!(transformed.json_expr.as_ref(), &col!("new_col"));
+        assert!(transformed.fail_on_error);
     }
 
     #[test]
