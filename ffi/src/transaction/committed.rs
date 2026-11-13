@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use delta_kernel::Result;
-use delta_kernel::transaction::CommitResult;
+use delta_kernel::transaction::{CommitResult, ExecutionMode};
 
 use super::ExclusiveCommittedTransaction;
 use crate::handle::Handle;
@@ -13,8 +13,8 @@ use crate::{OptionalValue, SharedSnapshot};
 /// The returned handle owns the committed transaction and must be released with
 /// [`free_committed_transaction`].
 // TODO(#3504): Preserve retryable and conflicted transaction state across the FFI boundary.
-pub(super) fn commit_result_to_committed_handle<STATE>(
-    result: Result<CommitResult<STATE>>,
+pub(super) fn commit_result_to_committed_handle<STATE, MODE: ExecutionMode>(
+    result: Result<CommitResult<STATE, MODE>>,
 ) -> Result<Handle<ExclusiveCommittedTransaction>> {
     match result? {
         CommitResult::Committed(committed) => Ok(Box::new(committed).into()),

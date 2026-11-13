@@ -1,6 +1,8 @@
 //! This module holds functionality for managing transactions.
 mod committed;
 mod create_table;
+#[cfg(feature = "declarative-plans")]
+mod declarative;
 mod deletion_vector;
 mod deletion_vector_writer;
 mod partition_value;
@@ -16,6 +18,8 @@ pub use committed::{
     free_committed_transaction,
 };
 pub use create_table::*;
+#[cfg(feature = "declarative-plans")]
+pub use declarative::*;
 pub use deletion_vector::{
     ExclusiveDvDescriptor, ExclusiveDvDescriptorMap, KernelDvStorageType, dv_descriptor_map_insert,
     dv_descriptor_map_new, dv_descriptor_new, free_dv_descriptor, free_dv_descriptor_map,
