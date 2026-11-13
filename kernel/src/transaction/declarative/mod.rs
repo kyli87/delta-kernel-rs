@@ -7,6 +7,10 @@ use precommit::{
     RemoveFileFieldsCheck,
 };
 
+use std::sync::Arc;
+use crate::actions::{Add, Remove};
+use crate::schema::{SchemaRef, ToSchema};
+
 use super::{CommitResult, Declarative, Transaction, UpdateTable};
 #[cfg(doc)]
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
@@ -28,6 +32,31 @@ impl<S> Transaction<S, Declarative> {
         Err(KernelError::unsupported(
             "Declarative transaction commits are not implemented",
         ))
+    }
+
+    /// Stages connector-prepared Add actions without rewriting physical metadata.
+    ///
+    /// The flat input schema is given by [`Self::add_actions_schema`]. Optional fields may be
+    /// omitted. JSON statistics, tags, deletion vectors and assigned row IDs are preserved.
+    pub fn add_actions_ref(&mut self, actions: RelationRef) {
+        self.staged_data_changes.add_actions.push(actions);
+    }
+
+    /// Returns the flat schema for connector-prepared Add actions.
+    pub fn add_actions_schema() -> SchemaRef {
+        Arc::new(Add::to_schema())
+    }
+
+    /// Returns the flat schema for connector-prepared Remove actions.
+    pub fn remove_actions_schema() -> SchemaRef {
+        Arc::new(Remove::to_schema())
+    }
+
+    /// Supplies exactly one row of connector commit-info fields. Kernel-owned fields override
+    /// connector values, while other fields and connector tags are retained.
+    pub fn with_commit_info_ref(mut self, commit_info: RelationRef) -> Self {
+        self.staged_data_changes.commit_info = Some(commit_info);
+        self
     }
 
     /// Add files to include in this transaction. This API generally enables the engine to
@@ -107,6 +136,13 @@ impl<S> Transaction<S, Declarative> {
 }
 
 impl Transaction<UpdateTable, Declarative> {
+    /// Stages connector-prepared Remove actions with the flat [`Self::remove_actions_schema`].
+    /// Optional fields may be omitted. The connector's deletion timestamp, tags and row IDs are
+    /// preserved, and the actions undergo the same pre-commit checks as generated actions.
+    pub fn remove_actions_ref(&mut self, actions: RelationRef) {
+        self.staged_data_changes.remove_actions.push(actions);
+    }
+
     /// Remove files from the table in this transaction. This API generally enables the engine to
     /// delete data (at file-level granularity) from the table. Note that this API can be called
     /// multiple times to remove multiple relations.

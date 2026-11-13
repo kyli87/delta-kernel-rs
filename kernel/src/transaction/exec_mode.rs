@@ -46,6 +46,9 @@ pub struct Imperative {
 pub struct Declarative {
     pub(super) add_files: Vec<RelationRef>,
     pub(super) remove_files: Vec<RelationRef>,
+    pub(super) add_actions: Vec<RelationRef>,
+    pub(super) remove_actions: Vec<RelationRef>,
+    pub(super) commit_info: Option<RelationRef>,
     // Each pair holds the new DV descriptors and the existing scan files to match against.
     pub(super) dv_updates: Vec<(RelationRef, RelationRef)>,
 }
@@ -75,11 +78,11 @@ impl StagedDataChanges for Imperative {
 #[cfg(feature = "declarative-plans")]
 impl StagedDataChanges for Declarative {
     fn has_adds(&self) -> bool {
-        !self.add_files.is_empty()
+        !self.add_files.is_empty() || !self.add_actions.is_empty()
     }
 
     fn has_removes(&self) -> bool {
-        !self.remove_files.is_empty()
+        !self.remove_files.is_empty() || !self.remove_actions.is_empty()
     }
 
     fn has_dv_inputs(&self) -> bool {
