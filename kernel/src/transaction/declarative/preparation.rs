@@ -25,7 +25,7 @@ use crate::schema::{DataType, SchemaRef, StructField, StructType, ToSchema, sche
 use crate::table_features::TableFeature;
 use crate::transaction::commit_info::{CommitInfoTagsVisitor, commit_info_literal_exprs};
 use crate::transaction::{CommitResult, NonfileCommitActions};
-use crate::{KernelError, KernelResult, Result, RowVisitor};
+use crate::{KernelError, KernelResult, Result, RowVisitor, version_as_i64};
 
 impl<S> Transaction<S, Declarative> {
     pub(super) fn commit_prepared(
@@ -393,59 +393,131 @@ impl<S> Transaction<S, Declarative> {
     fn prepare_file_relations(
         &self,
         executor: &dyn ScopedPlanExecutor,
-        _domains: &HashMap<String, DomainMetadata>,
+        domains: &HashMap<String, DomainMetadata>,
     ) -> KernelResult<(RelationRef, RelationRef, Option<i64>)> {
-        if !self.staged_data_changes.dv_updates.is_empty()
-            || self
-                .effective_table_config
-                .should_assign_fresh_row_tracking_metadata()
-        {
-            return Err(KernelError::unsupported(
-                "Declarative row tracking and DV updates",
-            ));
-        }
-        let mut adds = Vec::new();
+        let mut add_plans = Vec::new();
+        let commit_version = version_as_i64(self.get_commit_version())?;
+        let mut watermark = domains
+            .get(ROW_TRACKING_DOMAIN_NAME)
+            .map(|dm| parse_row_tracking_high_water_mark(dm.configuration()))
+            .transpose()?
+            .unwrap_or(-1);
+        let assign_ids = self
+            .effective_table_config
+            .should_assign_fresh_row_tracking_metadata();
         for reference in &self.staged_data_changes.add_files {
-            let plan = source(reference).project_patch(|patch| {
-                patch
-                    .append(
-                        StructField::nullable("dataChange", DataType::BOOLEAN),
-                        lit(self.data_change),
-                    )
-                    .replace(
-                        "stats",
-                        StructField::nullable("stats", DataType::STRING),
-                        Expression::unary(
-                            crate::expressions::UnaryExpressionOp::ToJson,
-                            col!("stats"),
-                        ),
-                    )
+            let mut plan = source(reference);
+            if assign_ids {
+                reject(
+                    executor,
+                    plan.clone(),
+                    Predicate::or(
+                        col!("stats.numRecords").is_null(),
+                        col!("stats.numRecords").lt(lit(0i64)),
+                    ),
+                    "Row tracking requires non-negative stats.numRecords",
+                )?;
+                let count = scalar(
+                    executor,
+                    plan.clone(),
+                    Agg::sum(column_name!("stats.numRecords")),
+                )?
+                .unwrap_or(0);
+                let start = watermark
+                    .checked_add(1)
+                    .ok_or_else(|| KernelError::invalid_transaction_state("Row ID overflow"))?;
+                watermark = watermark
+                    .checked_add(count)
+                    .ok_or_else(|| KernelError::invalid_transaction_state("Row ID overflow"))?;
+                plan = plan
+                    .prefix_sum(column_name!("stats.numRecords"), "_row_offset")?
+                    .project_patch(|p| {
+                        p.append(
+                            StructField::nullable("baseRowId", DataType::LONG),
+                            col!("_row_offset") + lit(start),
+                        )
+                        .append(
+                            StructField::nullable("defaultRowCommitVersion", DataType::LONG),
+                            lit(commit_version),
+                        )
+                        .drop("_row_offset")
+                    })?;
+            }
+            plan = plan.project_patch(|p| {
+                p.append(
+                    StructField::nullable("dataChange", DataType::BOOLEAN),
+                    lit(self.data_change),
+                )
+                .replace(
+                    "stats",
+                    StructField::nullable("stats", DataType::STRING),
+                    Expression::unary(crate::expressions::UnaryExpressionOp::ToJson, col!("stats")),
+                )
             })?;
-            adds.push(normalize(plan, Self::add_actions_schema())?);
+            add_plans.push(normalize(plan, Self::add_actions_schema())?);
         }
         for reference in &self.staged_data_changes.add_actions {
-            adds.push(normalize(source(reference), Self::add_actions_schema())?);
+            add_plans.push(normalize(source(reference), Self::add_actions_schema())?);
         }
-        let mut removes = Vec::new();
+        let mut remove_plans = Vec::new();
         for reference in &self.staged_data_changes.remove_files {
-            removes.push(self.scan_action(source(reference), false)?);
+            remove_plans.push(self.scan_action(source(reference), false)?);
+        }
+        for (new_dvs, files) in &self.staged_data_changes.dv_updates {
+            let (adds, removes) = self.prepare_dv_updates(executor, new_dvs, files)?;
+            add_plans.push(adds);
+            remove_plans.push(removes);
         }
         for reference in &self.staged_data_changes.remove_actions {
-            removes.push(normalize(source(reference), Self::remove_actions_schema())?);
+            remove_plans.push(normalize(source(reference), Self::remove_actions_schema())?);
         }
-        Ok((
-            retain(
+        let adds = retain(
+            executor,
+            "prepared_adds",
+            union_or_empty(add_plans, Self::add_actions_schema())?,
+        )?;
+        let removes = retain(
+            executor,
+            "prepared_removes",
+            union_or_empty(remove_plans, Self::remove_actions_schema())?,
+        )?;
+        if assign_ids {
+            let parsed = source(&adds).project_patch(|p| {
+                p.append(
+                    StructField::nullable("parsed", schema_ref! { nullable "numRecords": LONG }),
+                    Expression::parse_json_strict(
+                        col!("stats"),
+                        schema_ref! { nullable "numRecords": LONG },
+                    ),
+                )
+            })?;
+            reject(
                 executor,
-                "prepared_adds",
-                union_or_empty(adds, Self::add_actions_schema())?,
-            )?,
-            retain(
-                executor,
-                "prepared_removes",
-                union_or_empty(removes, Self::remove_actions_schema())?,
-            )?,
-            None,
-        ))
+                parsed.clone(),
+                Predicate::or_from([
+                    col!("baseRowId").is_null(),
+                    col!("baseRowId").lt(lit(0i64)),
+                    col!("defaultRowCommitVersion").is_null(),
+                    col!("defaultRowCommitVersion").lt(lit(0i64)),
+                    col!("parsed.numRecords").is_null(),
+                    col!("parsed.numRecords").lt(lit(0i64)),
+                ]),
+                "Row tracking requires valid row IDs and stats.numRecords",
+            )?;
+            let maximum = parsed.project(
+                Expression::struct_from(
+                    [col!("baseRowId") + col!("parsed.numRecords") - lit(1i64)],
+                ),
+                schema_ref! { nullable "last": LONG },
+            )?;
+            watermark = watermark
+                .max(scalar(executor, maximum, Agg::max(column_name!("last")))?.unwrap_or(-1));
+        }
+        let publish_watermark = assign_ids
+            && (self.is_create_table()
+                || !self.staged_data_changes.add_files.is_empty()
+                || !self.staged_data_changes.add_actions.is_empty());
+        Ok((adds, removes, publish_watermark.then_some(watermark)))
     }
 
     fn scan_action(&self, input: PlanBuilder, add: bool) -> KernelResult<PlanBuilder> {
@@ -485,6 +557,127 @@ impl<S> Transaction<S, Declarative> {
             })
             .collect::<Vec<_>>();
         input.project(Expression::struct_from(expressions), schema)
+    }
+
+    fn prepare_dv_updates(
+        &self,
+        executor: &dyn ScopedPlanExecutor,
+        new_dvs: &RelationRef,
+        files: &RelationRef,
+    ) -> KernelResult<(PlanBuilder, PlanBuilder)> {
+        if !self
+            .effective_table_config
+            .is_feature_enabled(&TableFeature::DeletionVectors)
+        {
+            return Err(KernelError::unsupported(
+                "Deletion vector writes require deletionVectors enabled",
+            ));
+        }
+        let dv_schema = crate::actions::deletion_vector::DeletionVectorDescriptor::to_schema();
+        let old_schema = crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable(
+            &Self::add_actions_schema(),
+        );
+        let joined_schema = schema_ref! {
+            nullable "path": STRING,
+            nullable "old": (old_schema.clone()),
+            nullable "new": (dv_schema.clone()),
+        };
+        let restored = normalize(
+            self.scan_action(source(files), true)?,
+            old_schema.clone().into(),
+        )?;
+        let restored_struct = Expression::struct_from(
+            restored
+                .schema()
+                .fields()
+                .map(|f| Expression::column([f.name().clone()])),
+        );
+        let left = restored.project(
+            Expression::struct_from([col!("path"), restored_struct, null_lit(dv_schema.clone())]),
+            joined_schema.clone(),
+        )?;
+        let right = source(new_dvs).project(
+            Expression::struct_from([col!("path"), null_lit(old_schema), col!("deletionVector")]),
+            joined_schema,
+        )?;
+        reject(
+            executor,
+            right.clone(),
+            Predicate::or(col!("path").is_null(), col!("new").is_null()),
+            "DV updates require a path and deletion vector",
+        )?;
+        let joined =
+            PlanBuilder::union_all([left, right])?.aggregate_by([column_name!("path")], |a| {
+                a.first_non_null(column_name!("old"))
+                    .first_non_null(column_name!("new"))
+                    .aggregate_as(Agg::count(column_name!("old")), "old_count")
+                    .aggregate_as(Agg::count(column_name!("new")), "new_count")
+            })?;
+        reject(
+            executor,
+            joined.clone(),
+            Predicate::and(
+                col!("new_count").gt(lit(0i64)),
+                Predicate::or(
+                    col!("new_count").ne(lit(1i64)),
+                    col!("old_count").ne(lit(1i64)),
+                ),
+            ),
+            "Each DV update must match exactly one existing file",
+        )?;
+        let joined = joined.filter(col!("new_count").eq(lit(1i64)))?;
+        let joined = retain(executor, "matched_dvs", joined)?;
+        let stats_schema = schema_ref! { ..(self.stats_schema()?.fields().filter(|f| f.name() != "tightBounds")), nullable "tightBounds": BOOLEAN };
+        let parsed = source(&joined).project_patch(|p| {
+            p.append(
+                StructField::nullable("parsed", stats_schema.clone()),
+                Expression::parse_json_strict(col!("old.stats"), stats_schema.clone()),
+            )
+        })?;
+        reject(
+            executor,
+            parsed.clone(),
+            Predicate::or(
+                col!("parsed.numRecords").is_null(),
+                col!("parsed.numRecords").lt(lit(0i64)),
+            ),
+            "DV updates require non-negative stats.numRecords",
+        )?;
+        let parsed = parsed.project_patch(|p| {
+            p.replace_at(
+                ["parsed"],
+                "tightBounds",
+                StructField::nullable("tightBounds", DataType::BOOLEAN),
+                lit(false),
+            )
+        })?;
+        let adds = parsed.project(
+            Expression::struct_from(Self::add_actions_schema().fields().map(|field| {
+                match field.name().as_str() {
+                    "deletionVector" => col!("new"),
+                    "stats" => Expression::unary(
+                        crate::expressions::UnaryExpressionOp::ToJson,
+                        col!("parsed"),
+                    ),
+                    name => Expression::column(["old", name]),
+                }
+            })),
+            Self::add_actions_schema(),
+        )?;
+        let removes = source(&joined).project(
+            Expression::struct_from(Self::remove_actions_schema().fields().map(|field| {
+                match field.name().as_str() {
+                    "deletionTimestamp" => lit(self.commit_timestamp),
+                    "extendedFileMetadata" => lit(true),
+                    name if Self::add_actions_schema().contains(name) => {
+                        Expression::column(["old", name])
+                    }
+                    _ => null_lit(field.data_type().clone()),
+                }
+            })),
+            Self::remove_actions_schema(),
+        )?;
+        Ok((adds, removes))
     }
 
     fn validate_relations(

@@ -1,8 +1,9 @@
 use rstest::rstest;
 
 use super::*;
-use crate::actions::deletion_vector::DeletionVectorDescriptor;
+use crate::actions::deletion_vector::{DeletionVectorDescriptor, DeletionVectorStorageType};
 use crate::committer::FileSystemCommitter;
+use crate::engine::arrow_data::EngineDataArrowExt;
 use crate::engine::sync::SyncEngine;
 use crate::engine::sync::plan::SyncPlanExecutor;
 use crate::expressions::{MapData, StructData};
@@ -198,7 +199,7 @@ fn staged_add(
 }
 
 #[rstest]
-fn create_append_remove_round_trip(#[values(false)] row_tracking: bool) -> Result<()> {
+fn create_append_remove_round_trip(#[values(false, true)] row_tracking: bool) -> Result<()> {
     let dir = tempfile::tempdir().map_err(KernelError::from)?;
     let engine = SyncEngine::new();
     let executor = SyncPlanExecutor::default().get_scoped();
@@ -399,6 +400,91 @@ fn version_conflict_preserves_winning_commit() -> Result<()> {
     Ok(())
 }
 
+#[rstest]
+fn dv_update_preserves_file_metadata_and_rejects_missing_matches(
+    #[values(false, true)] unmatched: bool,
+) -> Result<()> {
+    let dir = tempfile::tempdir().map_err(KernelError::from)?;
+    let engine = SyncEngine::new();
+    let executor = SyncPlanExecutor::default().get_scoped();
+    let mut create = create_table(
+        dir.path().to_string_lossy(),
+        schema_ref! { nullable "id": LONG },
+        "test",
+        true,
+    )
+    .with_table_properties([
+        ("delta.enableDeletionVectors", "true"),
+        ("delta.enableRowTracking", "true"),
+    ])
+    .with_execution_mode::<Declarative>()
+    .build(&engine, Box::new(FileSystemCommitter::new()))?;
+    create.add_files_ref(staged_add(&executor, "file.parquet", 10)?);
+    let snapshot = create
+        .commit_declarative(&executor)?
+        .unwrap_post_commit_snapshot();
+    let scan = snapshot.clone().scan_builder().build()?;
+    let batch = scan
+        .scan_metadata(&engine)?
+        .next()
+        .unwrap()?
+        .scan_files
+        .apply_selection_vector()?;
+    let reference =
+        executor.create_ref("scan", scan_row_schema(), batch.try_into_record_batch()?)?;
+    let descriptor =
+        DeletionVectorDescriptor::try_new(DeletionVectorStorageType::Inline, "test", None, 4, 2)?;
+    let schema = schema_ref! { nullable "path": STRING, nullable "deletionVector": (DeletionVectorDescriptor::to_schema()) };
+    let path = if unmatched {
+        "missing.parquet"
+    } else {
+        "file.parquet"
+    };
+    let dvs = executor.execute_and_retain(
+        "dvs",
+        crate::plans::PlanBuilder::values(schema, vec![vec![path.into(), descriptor.into()]])?
+            .build()?,
+    )?;
+    let mut txn = snapshot
+        .clone()
+        .update_table(UpdateTableOperation::Delete, "test", true)
+        .with_execution_mode::<Declarative>()
+        .build(&engine, Box::new(FileSystemCommitter::new()))?;
+    txn.ack_row_tracking_preservation();
+    txn.update_deletion_vectors_ref(dvs, reference);
+    if unmatched {
+        let error = txn.commit_declarative(&executor).unwrap_err();
+        assert!(error.to_string().contains("match exactly one"), "{error}");
+        assert!(
+            !dir.path()
+                .join("_delta_log/00000000000000000001.json")
+                .exists()
+        );
+    } else {
+        let committed = txn
+            .commit_declarative(&executor)?
+            .unwrap_post_commit_snapshot();
+        assert_eq!(
+            committed.get_file_stats_if_present().unwrap().num_files(),
+            1
+        );
+        let adds = ::test_utils::read_actions_from_commit(snapshot.table_root(), 1, "add").unwrap();
+        let removes =
+            ::test_utils::read_actions_from_commit(snapshot.table_root(), 1, "remove").unwrap();
+        assert_eq!(adds.len(), 1);
+        assert_eq!(removes.len(), 1);
+        assert_eq!(adds[0]["baseRowId"], 0);
+        assert_eq!(adds[0]["defaultRowCommitVersion"], 0);
+        assert_eq!(adds[0]["deletionVector"]["cardinality"], 2);
+        let stats: serde_json::Value =
+            serde_json::from_str(adds[0]["stats"].as_str().unwrap()).unwrap();
+        assert_eq!(stats["numRecords"], 10);
+        assert_eq!(stats["tightBounds"], false);
+        assert!(removes[0]["deletionVector"].is_null());
+    }
+    Ok(())
+}
+
 #[test]
 fn domain_transactions_and_commit_info_are_preserved() -> Result<()> {
     let dir = tempfile::tempdir().map_err(KernelError::from)?;
@@ -521,6 +607,67 @@ fn malformed_prepared_actions_do_not_commit(
             .join("_delta_log/00000000000000000000.json")
             .exists()
     );
+    Ok(())
+}
+
+#[test]
+fn prepared_actions_preserve_stats_tags_and_row_ids() -> Result<()> {
+    let dir = tempfile::tempdir().map_err(KernelError::from)?;
+    let engine = SyncEngine::new();
+    let executor = SyncPlanExecutor::default().get_scoped();
+    let snapshot = create_table(
+        dir.path().to_string_lossy(),
+        schema_ref! { nullable "id": LONG },
+        "test",
+        true,
+    )
+    .with_table_properties([("delta.enableRowTracking", "true")])
+    .with_execution_mode::<Declarative>()
+    .build(&engine, Box::new(FileSystemCommitter::new()))?
+    .commit_declarative(&executor)?
+    .unwrap_post_commit_snapshot();
+    let stats = r#"{ "numRecords": 2, "minValues": { "id": 7 } }"#;
+    let raw = prepared_add(&executor, stats, vec![])?;
+    let tags = MapData::try_new(
+        MapType::new(DataType::STRING, DataType::STRING, true),
+        [("source", Some("connector".to_string()))],
+    )?;
+    let plan = PlanBuilder::relation_source(raw).project_patch(|p| {
+        p.append(
+            crate::schema::StructField::nullable("baseRowId", DataType::LONG),
+            crate::expressions::lit(20i64),
+        )
+        .append(
+            crate::schema::StructField::nullable("defaultRowCommitVersion", DataType::LONG),
+            crate::expressions::lit(0i64),
+        )
+        .append(
+            crate::schema::StructField::nullable(
+                "tags",
+                MapType::new(DataType::STRING, DataType::STRING, true),
+            ),
+            crate::expressions::lit(tags),
+        )
+    })?;
+    let mut txn = snapshot
+        .clone()
+        .update_table(UpdateTableOperation::Write, "test", true)
+        .with_execution_mode::<Declarative>()
+        .build(&engine, Box::new(FileSystemCommitter::new()))?
+        .with_row_tracking_high_water_mark(21)?;
+    txn.add_actions_ref(executor.execute_and_retain("prepared", plan.build()?)?);
+    let after = txn
+        .commit_declarative(&executor)?
+        .unwrap_post_commit_snapshot();
+    assert_eq!(
+        after.reader().get_row_tracking_high_water_mark(&engine)?,
+        Some(21)
+    );
+    let adds = ::test_utils::read_actions_from_commit(after.table_root(), 1, "add").unwrap();
+    assert_eq!(adds[0]["stats"], stats);
+    assert_eq!(adds[0]["tags"]["source"], "connector");
+    assert_eq!(adds[0]["baseRowId"], 20);
+    assert_eq!(adds[0]["defaultRowCommitVersion"], 0);
     Ok(())
 }
 
